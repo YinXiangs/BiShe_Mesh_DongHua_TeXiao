@@ -38,6 +38,7 @@ function postalArt(kind='scene'){
   return '<svg viewBox="0 0 320 250" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect width="320" height="250" fill="'+bg+'"/><circle cx="257" cy="53" r="24" fill="#fff" opacity=".28"/><ellipse cx="162" cy="213" rx="100" ry="13" fill="#25483e" opacity=".08"/>'+shape+'</svg>';
 }
 async function refresh(){
+  assetPreviews.clear();previewObserver?.disconnect();
   state.accessError=null;
   if(state.token){
     state.mode='guest';state.demo=false;
@@ -69,6 +70,7 @@ async function ensureAssetPreview(asset){
  if(asset.demo||assetPreviews.has(key))return;
  const pending={};assetPreviews.set(key,pending);
  const job=async()=>{
+ if(assetPreviews.get(key)!==pending)return;
  if(previewKey(asset)!==key){assetPreviews.delete(key);return;}
  try{
   const versions=source.versions?source.versions.filter(v=>v.asset_id===asset.id):source.local?await db.getVersions(asset.id):await source.cloud.listVersions(asset.id);
