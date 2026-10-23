@@ -69,7 +69,7 @@ function renderAccess(){
    if(!role){error.textContent='密码不正确，请重新输入。';input.focus();return;}
    if(!saveEntrySession(role))throw Error('浏览器禁止保存当前会话，请允许此网站使用会话存储后重试。');
    state.entryRole=role;await refresh();
-   if(role==='teacher')dialog('欢迎黄静妮教授登陆网站！','<div class="welcome-panel"><div class="welcome-symbol">'+ico('mail')+'</div><p class="welcome-en" lang="en">Welcome, Professor Huang Jingni!</p><p>期待您的指导，让每一份作品继续成长。</p><button class="button primary" id="welcome-start">开始检查作品</button></div>').querySelector('#welcome-start').onclick=event=>event.target.closest('dialog').close();
+   if(role==='teacher')dialog('欢迎黄静妮教授登陆网站！','<div class="welcome-panel"><div class="welcome-symbol">'+ico('mail')+'</div><h2 class="welcome-cn">欢迎黄静妮教授登陆网站！</h2><p class="welcome-en" lang="en">Welcome, Professor Huang Jingni!</p><p>期待您的指导，让每一份作品继续成长。</p><button class="button primary" id="welcome-start">开始检查作品</button></div>').querySelector('#welcome-start').onclick=event=>event.target.closest('dialog').close();
   }catch(e){if(form.isConnected)error.textContent=e.message||'暂时无法进入，请稍后重试。';else toast(e.message);}
   finally{button.disabled=false;}
  };
