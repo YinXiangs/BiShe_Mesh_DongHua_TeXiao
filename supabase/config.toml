@@ -1,0 +1,6 @@
+project_id = "qixi-post-review"
+
+# The teacher uses an unguessable review token, not a Supabase Auth session.
+# Every request is checked inside review-share. Do not remove its token validation.
+[functions.review-share]
+verify_jwt = false
