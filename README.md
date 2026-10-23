@@ -2,7 +2,7 @@
 
 把场景、角色、产品、动画与特效集中排列，方便你持续提交版本，也方便指导老师在异地打开作品、检查细节并留下意见。五类作品均可按需要新增，数量不限。
 
-**当前交付的是待部署的网站源码。尚未确认目标仓库的连接状态，也未发布上线。** 目标仓库为 [YinXiangs/BiShe_Mesh_DongHua_TeXiao](https://github.com/YinXiangs/BiShe_Mesh_DongHua_TeXiao)；成功部署后的预期地址为 [栖息邮局评审网站](https://yinxiangs.github.io/BiShe_Mesh_DongHua_TeXiao/)。
+**网站前端已部署到 GitHub Pages；共享存储尚待初始化。** 仓库为 [YinXiangs/BiShe_Mesh_DongHua_TeXiao](https://github.com/YinXiangs/BiShe_Mesh_DongHua_TeXiao)，访问 [栖息邮局评审网站](https://yinxiangs.github.io/BiShe_Mesh_DongHua_TeXiao/)。未配置 Supabase 时可体验演示和本机草稿；完成下面的共享配置后，老师才能跨设备访问真实提交和留言。后续发布结果以仓库 Actions 为准。
 
 先分清两种保存方式：
 
