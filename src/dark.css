@@ -134,3 +134,7 @@ input::placeholder, textarea::placeholder { color: #8ba091; opacity: 1; }
 .loading::before { border-color: #668770; border-top-color: #c5e3ce; }
 .button.primary, .viewer-column > .viewer-toolbar .button.primary { background: #356b52; border-color: #4d8b6b; color: #fff; }
 .button.primary:hover, .viewer-column > .viewer-toolbar .button.primary:hover { background: #407c5f; border-color: #639e7a; color: #fff; }
+.asset-preview { position: absolute; inset: 0; display: grid; place-items: center; background: #141e1a; }
+.asset-preview > img, .asset-preview > svg { display: block; width: 100%; height: 100%; object-fit: contain; }
+.preview-message { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 18px; color: #adc5b5; font-size: 12px; line-height: 1.7; text-align: center; }
+.asset-preview .preview-message > svg { flex: 0 0 24px; width: 24px; height: 24px; }

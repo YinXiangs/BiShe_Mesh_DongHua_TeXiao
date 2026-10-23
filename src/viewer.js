@@ -28,8 +28,8 @@ function depth(n,root){let d=0;while(n!==root&&n.parent){d++;n=n.parent;}return 
 function dispose(root){root?.traverse(o=>{o.geometry?.dispose();for(const m of(Array.isArray(o.material)?o.material:[o.material]))if(m){for(const v of Object.values(m))if(v?.isTexture)v.dispose();m.dispose();}});}
 
 export class ReviewViewer {
-  constructor(container,onUpdate=()=>{}) {
-    this.container=container;this.onUpdate=onUpdate;this.urls=[];this.helpers=[];this.mode='material';this.playing=false;this.speed=1;this.frame=0;this.dead=false;this.clips=[];
+  constructor(container,onUpdate=()=>{},options={}) {
+    this.container=container;this.onUpdate=onUpdate;this.urls=[];this.helpers=[];this.mode='material';this.playing=false;this.speed=1;this.frame=0;this.dead=false;this.clips=[];this.loadId=0;
     this.renderer=new THREE.WebGLRenderer({antialias:true,alpha:false,preserveDrawingBuffer:true});
     this.renderer.setPixelRatio(Math.min(devicePixelRatio,2));this.renderer.setClearColor(0x141e1a);this.renderer.outputColorSpace=THREE.SRGBColorSpace;
     this.renderer.toneMapping=THREE.ACESFilmicToneMapping;this.renderer.toneMappingExposure=1.25;
@@ -39,28 +39,35 @@ export class ReviewViewer {
     this.scene.add(new THREE.HemisphereLight(0xffffff,0x737c61,3));
     const key=new THREE.DirectionalLight(0xffe6c7,3.5);key.position.set(5,8,6);this.scene.add(key);
     const fill=new THREE.DirectionalLight(0xb6d6e6,2);fill.position.set(-6,3,-3);this.scene.add(fill);
-    this.grid=new THREE.GridHelper(20,20,0x4d6b5a,0x293f33);this.grid.position.y=-.015;this.scene.add(this.grid);
+    this.grid=new THREE.GridHelper(20,20,0x4d6b5a,0x293f33);this.grid.position.y=-.015;this.grid.visible=options.grid!==false;this.scene.add(this.grid);
     this.resize=new ResizeObserver(()=>this.fitCanvas());this.resize.observe(container);this.clock=new THREE.Clock();
-    this.loop=()=>{if(this.dead)return;this.frame=requestAnimationFrame(this.loop);const dt=Math.min(this.clock.getDelta(),.1);if(this.mixer&&this.playing)this.mixer.update(dt*this.speed);this.controls.update();this.skeleton?.update();this.renderer.render(this.scene,this.camera);};this.loop();
+    this.loop=()=>{if(this.dead)return;this.frame=requestAnimationFrame(this.loop);const dt=Math.min(this.clock.getDelta(),.1);if(this.mixer&&this.playing)this.mixer.update(dt*this.speed);this.renderFrame();};if(options.animate!==false)this.loop();
   }
-  fitCanvas(){const {width,height}=this.container.getBoundingClientRect();if(!width||!height)return;this.renderer.setSize(width,height,false);this.camera.aspect=width/height;this.camera.updateProjectionMatrix();}
-  clear(){this.clearHelpers();if(this.root){this.scene.remove(this.root);dispose(this.root);}this.mixer?.stopAllAction();this.mixer=null;this.clips=[];this.playing=false;this.originals=new Map();for(const u of this.urls)URL.revokeObjectURL(u);this.urls=[];}
+  renderFrame(){if(this.dead)return;this.controls.update();this.skeleton?.update();this.renderer.render(this.scene,this.camera);}
+  fitCanvas(){const {width,height}=this.container.getBoundingClientRect();if(!width||!height)return;this.renderer.setSize(width,height,false);this.camera.aspect=width/height;this.camera.updateProjectionMatrix();this.renderFrame();}
+  clear(){this.loadId++;this.clearHelpers();this.mixer?.stopAllAction();if(this.mixer&&this.root)this.mixer.uncacheRoot(this.root);if(this.root){this.scene.remove(this.root);dispose(this.root);}this.root=null;this.stats=null;this.mixer=null;this.action=null;this.clip=null;this.clips=[];this.playing=false;this.originals=new Map();for(const u of this.urls)URL.revokeObjectURL(u);this.urls=[];this.renderFrame();}
   async loadFiles(files){
-    this.clear();const main=files.find(f=>/\.fbx$/i.test(f.name));if(!main)throw Error('请选择一个 FBX 模型或动画文件。');
+    this.clear();const loadId=this.loadId,main=files.find(f=>/\.fbx$/i.test(f.name));if(!main)throw Error('请选择一个 FBX 模型或动画文件。');
     const map=new Map(),byName=new Map(),missing=new Set();
     for(const f of files){const u=URL.createObjectURL(f);this.urls.push(u);const name=normalize(f.relativePath||f.webkitRelativePath||f.name);map.set(name,u);byName.set(f.name.toLowerCase(),u);}
-    const manager=new THREE.LoadingManager();
+    const manager=new THREE.LoadingManager();let started=false,completeTextures,timer,object;
+    const texturesReady=new Promise(resolve=>{completeTextures=resolve;});
+    manager.onStart=()=>{started=true;};manager.onLoad=()=>completeTextures();
     const placeholder='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
     manager.setURLModifier(url=>{
-      if(/^(blob:|data:)/i.test(url))return url;
+      if(/^(blob:|data:)/i.test(url)){if(/^blob:/i.test(url)&&!this.urls.includes(url))this.urls.push(url);return url;}
       const n=normalize(url),basename=n.split('/').pop();const found=map.get(n)||byName.get(basename);
       if(found)return found;missing.add(url);return placeholder;
     });
     manager.addHandler(/\.tga$/i,new TGALoader(manager));
     manager.onError=url=>missing.add(url);
-    manager.onLoad=()=>{if(this.root){this.stats.missingTextures=[...missing];this.onUpdate(this.stats);}};
-    const data=await main.arrayBuffer();if(this.dead)return;const object=new FBXLoader(manager).parse(data,'');
-    this.setObject(object);this.stats.missingTextures=[...missing];this.onUpdate(this.stats);return this.stats;
+    try{
+      const data=await main.arrayBuffer();if(this.dead||loadId!==this.loadId)throw Error('模型预览已取消。');object=new FBXLoader(manager).parse(data,'');
+      if(started)await Promise.race([texturesReady,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('模型贴图读取超时，请检查贴图后重试。')),15000);})]);
+      if(this.dead||loadId!==this.loadId)throw Error('模型预览已取消。');
+      this.setObject(object);this.stats.missingTextures=[...missing];this.onUpdate(this.stats);this.renderFrame();return this.stats;
+    }catch(error){if(object&&object!==this.root)dispose(object);if(loadId===this.loadId)this.clear();throw error;}
+    finally{clearTimeout(timer);}
   }
   loadDemo(kind){this.clear();this.setObject(makeDemo(kind));return this.stats;}
   setObject(object){
@@ -75,25 +82,44 @@ export class ReviewViewer {
     if(this.clips.length){this.mixer=new THREE.AnimationMixer(object);this.selectClip(0);}
     this.resetCamera();this.setMode(this.mode);this.fitCanvas();this.onUpdate(this.stats);
   }
-  resetCamera(){this.controls.target.set(0,1.7,0);this.camera.position.set(6.8,4.6,7.4);this.controls.update();}
+  resetCamera(){this.controls.target.set(0,1.7,0);this.camera.position.set(6.8,4.6,7.4);this.controls.update();this.renderFrame();}
   setMode(mode){this.mode=mode;this.clearHelpers();this.root?.traverse(o=>{if(!o.isMesh)return;
     const old=o.material,original=this.originals.get(o.uuid);if(old!==original)for(const m of(Array.isArray(old)?old:[old]))m.dispose();
     if(mode==='normal')o.material=new THREE.MeshNormalMaterial({side:THREE.DoubleSide});
     else if(mode==='wireframe')o.material=(Array.isArray(original)?original:[original]).map(m=>{const clone=m.clone();clone.wireframe=true;clone.map=null;clone.emissiveMap=null;clone.color?.set(0xadd7bf);clone.emissive?.set(0x2c4d3b);return clone;});
     else o.material=original;
-  });}
-  showNormals(on){this.clearHelpers();if(!on||!this.root)return;if(this.stats.skinned)throw Error('骨骼动画请使用“法向着色”。箭头仅适用于静态网格。');
+  });this.renderFrame();}
+  showNormals(on){this.clearHelpers();if(!on||!this.root){this.renderFrame();return;}if(this.stats.skinned){this.renderFrame();throw Error('骨骼动画请使用“法向着色”。箭头仅适用于静态网格。');}
     this.root.traverse(o=>{if(o.isMesh&&o.geometry.getAttribute('normal')){const h=new VertexNormalsHelper(o,.07,0x82cda2);this.scene.add(h);this.helpers.push(h);}});
+    this.renderFrame();
   }
   clearHelpers(){for(const h of this.helpers){this.scene.remove(h);h.dispose();}this.helpers=[];if(this.skeleton){this.scene.remove(this.skeleton);this.skeleton.dispose();this.skeleton=null;}}
-  showSkeleton(on){if(this.skeleton){this.scene.remove(this.skeleton);this.skeleton.dispose();this.skeleton=null;}if(on&&this.root){this.skeleton=new THREE.SkeletonHelper(this.root);this.scene.add(this.skeleton);}}
-  nodeVisible(id,value){const o=this.root?.getObjectByProperty('uuid',id);if(o)o.visible=value;}
-  selectClip(i){if(!this.mixer)return;this.mixer.stopAllAction();this.clip=this.clips[i];this.action=this.mixer.clipAction(this.clip);this.action.play();this.mixer.setTime(0);this.playing=true;}
-  setTime(t){if(this.mixer){this.mixer.setTime(Number(t));this.playing=false;}}
+  showSkeleton(on){if(this.skeleton){this.scene.remove(this.skeleton);this.skeleton.dispose();this.skeleton=null;}if(on&&this.root){this.skeleton=new THREE.SkeletonHelper(this.root);this.scene.add(this.skeleton);}this.renderFrame();}
+  nodeVisible(id,value){const o=this.root?.getObjectByProperty('uuid',id);if(o)o.visible=value;this.renderFrame();}
+  selectClip(i){if(!this.mixer)return;this.mixer.stopAllAction();this.clip=this.clips[i];this.action=this.mixer.clipAction(this.clip);this.action.play();this.mixer.setTime(0);this.playing=true;this.renderFrame();}
+  setTime(t){if(this.mixer){this.mixer.setTime(Number(t));this.playing=false;this.renderFrame();}}
   context(){return {camera:this.camera.position.toArray(),target:this.controls.target.toArray(),time:this.action?.time||0,clip:this.clip?.name||'',mode:this.mode};}
-  restore(c){if(c?.camera?.length===3&&c?.target?.length===3&&[...c.camera,...c.target].every(Number.isFinite)){this.camera.position.fromArray(c.camera);this.controls.target.fromArray(c.target);this.controls.update();}if(Number.isFinite(c?.time))this.setTime(c.time);}
-  thumbnail(){return this.renderer.domElement.toDataURL('image/jpeg',.75);}
+  restore(c){if(c?.camera?.length===3&&c?.target?.length===3&&[...c.camera,...c.target].every(Number.isFinite)){this.camera.position.fromArray(c.camera);this.controls.target.fromArray(c.target);this.controls.update();}if(Number.isFinite(c?.time))this.setTime(c.time);this.renderFrame();}
+  thumbnail(){this.renderFrame();return encodeThumbnail(this.renderer.domElement);}
   destroy(){this.dead=true;cancelAnimationFrame(this.frame);this.resize.disconnect();this.controls.dispose();this.clear();this.grid.geometry.dispose();this.grid.material.dispose();this.renderer.dispose();this.renderer.domElement.remove();}
+}
+export function encodeThumbnail(source,{width=640,height=400,maxBytes=180*1024}={}){
+  const canvas=document.createElement('canvas');let quality=.78;
+  canvas.width=width;canvas.height=height;
+  for(;;){
+    const context=canvas.getContext('2d');if(!context)throw Error('当前浏览器无法生成预览图片。');
+    context.fillStyle='#141e1a';context.fillRect(0,0,canvas.width,canvas.height);
+    const sourceWidth=source.videoWidth||source.width,sourceHeight=source.videoHeight||source.height;
+    if(!sourceWidth||!sourceHeight)throw Error('文件没有可生成预览的画面。');
+    const ratio=Math.min(canvas.width/sourceWidth,canvas.height/sourceHeight),w=sourceWidth*ratio,h=sourceHeight*ratio;
+    context.drawImage(source,(canvas.width-w)/2,(canvas.height-h)/2,w,h);
+    const image=canvas.toDataURL('image/jpeg',quality);
+    if(!image.startsWith('data:image/jpeg;base64,'))throw Error('浏览器无法编码 JPEG 预览图片。');
+    if(image.length<=maxBytes)return image;
+    if(quality>.46)quality=Math.max(.46,quality-.12);
+    else if(canvas.width>160){canvas.width=Math.max(160,Math.floor(canvas.width*.75));canvas.height=Math.max(100,Math.floor(canvas.height*.75));}
+    else throw Error('预览图片超过大小限制，请重试。');
+  }
 }
 function normalize(p){try{p=decodeURIComponent(p);}catch{}return p.replace(/\\/g,'/').replace(/^\.\//,'').toLowerCase();}
 
