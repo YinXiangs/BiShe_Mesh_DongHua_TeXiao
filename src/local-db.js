@@ -99,9 +99,84 @@ export function createLocalDb({ factory = globalThis.indexedDB, name = DATABASE_
   }
 
   return {
-    async getAssets() {
+    async getAssets({ includeDeleted = false } = {}) {
       const rows = await transaction(['assets'], 'readonly', (tx) => requestResult(tx.objectStore('assets').getAll()));
-      return rows.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+      return rows.filter((row) => includeDeleted || !row.deleted_at).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    },
+
+    async getDeletedAssets() {
+      const rows = await transaction(['assets'], 'readonly', (tx) => requestResult(tx.objectStore('assets').getAll()));
+      return rows.filter((row) => row.deleted_at).sort((a, b) => b.deleted_at.localeCompare(a.deleted_at) || b.updated_at.localeCompare(a.updated_at));
+    },
+
+    async softDeleteAsset(assetId) {
+      return transaction(['assets'], 'readwrite', async (tx) => {
+        const assets = tx.objectStore('assets');
+        const asset = await requestResult(assets.get(assetId));
+        if (!asset) throw new Error('项目不存在，无法移入回收站。');
+        if (asset.deleted_at) return asset;
+        const row = { ...asset, deleted_at: new Date().toISOString() };
+        await requestResult(assets.put(row));
+        return row;
+      });
+    },
+
+    async restoreAsset(assetId) {
+      return transaction(['assets'], 'readwrite', async (tx) => {
+        const assets = tx.objectStore('assets');
+        const asset = await requestResult(assets.get(assetId));
+        if (!asset) throw new Error('项目不存在，无法恢复。');
+        if (!asset.deleted_at) return asset;
+        const row = { ...asset, deleted_at: null };
+        await requestResult(assets.put(row));
+        return row;
+      });
+    },
+
+    async markRead(assetId, versionId) {
+      return transaction(['assets', 'versions'], 'readwrite', async (tx) => {
+        const assets = tx.objectStore('assets');
+        const asset = await requestResult(assets.get(assetId));
+        if (!asset) throw new Error('项目不存在，无法记录已读状态。');
+        const versions = tx.objectStore('versions');
+        const version = await requestResult(versions.get(versionId));
+        if (!version || version.asset_id !== assetId) throw new Error('所查看的版本不属于此项目。');
+        const rows = await requestResult(versions.index('asset_id').getAll(assetId));
+        if (rows.some((row) => row.number > version.number) || asset.teacher_read_version_id === versionId) return asset;
+        const row = { ...asset, teacher_read_version_id: versionId, teacher_read_at: new Date().toISOString() };
+        await requestResult(assets.put(row));
+        return row;
+      });
+    },
+
+    async setReviewStatus(assetId, status, versionId) {
+      if (!['review', 'changes', 'approved'].includes(status)) throw new Error('请选择待检查、待修改或已通过。');
+      return transaction(['assets', 'versions'], 'readwrite', async (tx) => {
+        const assets = tx.objectStore('assets');
+        const asset = await requestResult(assets.get(assetId));
+        if (!asset) throw new Error('项目不存在，无法保存评审状态。');
+        if (asset.deleted_at) throw new Error('作品已移入回收站，无法保存评审状态。');
+        if (!versionId) throw new Error('请打开作品的最新版本后检查。');
+        const versions = tx.objectStore('versions');
+        const version = await requestResult(versions.get(versionId));
+        const rows = await requestResult(versions.index('asset_id').getAll(assetId));
+        const latest = rows.reduce((current, row) => !current || row.number > current.number ? row : current, null);
+        if (!version || version.asset_id !== assetId || latest?.id !== versionId) throw new Error('作品已有新版本，请重新打开最新版本后检查。');
+        const row = { ...asset, status };
+        await requestResult(assets.put(row));
+        return row;
+      });
+    },
+
+    async updateAssetMetadata(assetId, { title, description }) {
+      return transaction(['assets'], 'readwrite', async (tx) => {
+        const assets = tx.objectStore('assets');
+        const asset = await requestResult(assets.get(assetId));
+        if (!asset) throw new Error('项目不存在，无法保存作品说明。');
+        const row = validateAsset({ ...asset, title, description, updated_at: new Date().toISOString() });
+        await requestResult(assets.put(row));
+        return row;
+      });
     },
 
     async putAsset(input) {
@@ -140,7 +215,11 @@ export function createLocalDb({ factory = globalThis.indexedDB, name = DATABASE_
         await Promise.all(oldKeys.map((key) => requestResult(storedFiles.delete(key))));
         await requestResult(versions.put(row));
         await Promise.all(records.map((record) => requestResult(storedFiles.put(record))));
-        await requestResult(assets.put({ ...asset, updated_at: new Date().toISOString() }));
+        await requestResult(assets.put({
+          ...asset,
+          ...(!existing ? { status: 'review', teacher_read_version_id: null, teacher_read_at: null } : {}),
+          updated_at: new Date().toISOString(),
+        }));
         return row;
       });
     },

@@ -1,0 +1,76 @@
+.access-screen {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 40px 24px;
+  background: radial-gradient(ellipse at 50% 12%, #213b2e 0, #14221b 43%, #101815 78%);
+}
+.access-card {
+  width: min(100%, 430px);
+  padding: 40px;
+  border: 1px solid #3b5947;
+  border-radius: 18px;
+  background: #1b2822f5;
+  box-shadow: 0 24px 80px #0005;
+}
+.access-brand { display: flex; align-items: center; gap: 13px; margin-bottom: 36px; color: #e4eee7; }
+.access-brand > svg, .access-brand .brand-icon { width: 40px; height: 46px; color: #a3cbb0; flex-shrink: 0; }
+.access-brand strong { display: block; font-size: 22px; font-weight: 600; line-height: 1.6; letter-spacing: 3px; }
+.access-brand small { display: block; font-size: 9px; line-height: 1.8; letter-spacing: 2.2px; color: #a0b6a7; }
+.access-eyebrow { margin: 0 0 12px; color: #dcab7f; font-size: 10px; font-weight: 500; line-height: 1.6; letter-spacing: 2px; }
+.access-card h1 { margin: 0 0 12px; font-size: 25px; line-height: 1.5; font-weight: 600; color: #e4eee7; }
+.access-subtitle { margin: 0 0 28px; color: #a3b6aa; font-size: 12px; line-height: 1.9; }
+.access-form .field { gap: 10px; margin-bottom: 18px; color: #c5d9cd; font-size: 12px; }
+.access-form .field input { width: 100%; min-height: 48px; padding: 12px 14px; background: #111f17; border: 1px solid #42604b; color: #eef7f0; font-size: 16px; letter-spacing: 3px; }
+.access-form .field input::placeholder { color: #8ca191; font-size: 12px; letter-spacing: .5px; }
+.access-form .field input:focus { border-color: #93bda0; outline: 2px solid #93bda02a; }
+.access-form > .button { width: 100%; min-height: 46px; font-size: 13px; }
+.access-error { margin: 0 0 16px; padding: 10px 12px; border: 1px solid #7f4948; border-radius: 8px; background: #412726; color: #ffc2bb; font-size: 12px; line-height: 1.7; }
+.access-error:empty { display: none; }
+.access-footer { padding-top: 24px; margin: 26px 0 0; border-top: 1px solid #30473b; color: #95aa9c; font-size: 10px; line-height: 1.9; letter-spacing: .4px; }
+.identity-chip { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 28px; padding: 5px 9px; border: 1px solid #45634f; border-radius: 6px; background: #22392b; color: #c8e3d0; font-size: 10px; line-height: 1.5; white-space: nowrap; }
+.identity-chip svg { width: 13px; height: 13px; }
+.session-actions { display: flex; align-items: center; justify-content: flex-end; gap: 9px; flex-wrap: wrap; }
+.session-actions .button { min-height: 29px; padding: 6px 9px; font-size: 10px; }
+.welcome-panel { padding: 38px 30px 30px; text-align: center; }
+.welcome-symbol { display: grid; place-items: center; width: 58px; height: 58px; margin: 0 auto 23px; border: 1px solid #6f9270; border-radius: 50%; background: #294432; color: #d3e7bd; font-size: 27px; line-height: 1; }
+.welcome-symbol svg { width: 29px; height: 29px; }
+.welcome-panel h2 { margin: 0 0 10px; color: #e8f2e9; font-size: 22px; line-height: 1.7; }
+.welcome-en { margin: 0 auto 28px; max-width: 340px; color: #c6b18d; font-family: Georgia, "Times New Roman", serif; font-size: 15px; line-height: 1.8; letter-spacing: .4px; }
+.welcome-panel > .button { min-width: 160px; min-height: 43px; }
+.read-badge { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; padding: 4px 7px; border: 1px solid transparent; border-radius: 4px; font-size: 9px; font-weight: 400; line-height: 1.3; white-space: nowrap; letter-spacing: .1px; }
+.read-badge svg { width: 11px; height: 11px; }
+.read-badge.read { color: #bdddc9; background: #223e30; border-color: #385d48; }
+.read-badge.unread { color: #b2bdb5; background: #29312c; border-color: #414d44; }
+.badge.review, .badge.pending { color: #f2d17a; background: #493b1d; }
+.badge.changes { color: #ffb5af; background: #522c2d; }
+.badge.approved { color: #a9e3b8; background: #254b34; }
+.review-status-select { background: #14221a; border: 1px solid #42604b; color: #e4eee7; }
+.review-status-select option[value="review"], .review-status-select option[value="pending"] { color: #f2d17a; background: #1b2822; }
+.review-status-select option[value="changes"] { color: #ffb5af; background: #1b2822; }
+.review-status-select option[value="approved"] { color: #a9e3b8; background: #1b2822; }
+.button.danger { color: #ffc0b8; background: #482a2b; border-color: #7f4948; }
+.button.danger:hover { color: #ffe4de; background: #603637; border-color: #b26b63; }
+.permission-note { margin: 0; padding: 17px 21px; color: #a3b6aa; font-size: 11px; line-height: 1.85; }
+.deleted-state { padding: 32px 22px; color: #b0c3b5; text-align: center; line-height: 1.9; }
+.deleted-state h3 { color: #d0e3d5; }
+
+@media (max-width: 640px) {
+  .access-screen { padding: 24px 18px; }
+  .access-card { padding: 30px 25px; border-radius: 14px; }
+  .access-brand { margin-bottom: 29px; gap: 11px; }
+  .access-brand strong { font-size: 21px; }
+  .access-brand small { font-size: 8px; letter-spacing: 2px; }
+  .access-card h1 { font-size: 23px; }
+  .access-subtitle { margin-bottom: 25px; }
+  .access-footer { padding-top: 21px; margin-top: 23px; }
+  .session-actions { gap: 6px; }
+  .identity-chip { font-size: 9px; padding: 4px 7px; min-height: 27px; }
+  .session-actions .button { font-size: 9px; padding: 5px 7px; min-height: 27px; }
+  .welcome-panel { padding: 30px 22px 25px; }
+  .welcome-panel h2 { font-size: 19px; }
+  .welcome-en { font-size: 14px; }
+  .read-badge { font-size: 9px; padding: 4px 6px; }
+  .permission-note { padding: 15px 17px; }
+}

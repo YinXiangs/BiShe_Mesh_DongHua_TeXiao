@@ -9,7 +9,8 @@ const uuid = (value, name = 'id') => {
   return value;
 };
 const safeName = (name) => name.normalize('NFC').replace(/[\\/\u0000-\u001f<>:"|?*]/g, '_').slice(-180) || 'file';
-const assetFields = ({ title, category, description = '', status = 'pending' }) => ({ title, category, description, status });
+// Workflow fields belong to server-side reviewer RPCs, never student form input.
+const assetFields = ({ title, category, description = '' }) => ({ title, category, description });
 function relativeName(file) {
   const raw = file.relativePath || file.webkitRelativePath || file.name;
   if (typeof raw !== 'string' || typeof file.name !== 'string') throw new Error('文件路径无效');
@@ -61,17 +62,28 @@ export function createCloud(config) {
   async function requireOwner() {
     if (await role() !== 'owner') throw new Error('需要项目所有者权限');
   }
+  async function requireReviewer() {
+    if (await role() !== 'reviewer') throw new Error('需要已认证的老师账户；网站访问口令不能代替云端身份认证');
+  }
   async function listAssets() {
-    const { data, error } = await client.from('assets').select('*').order('created_at', { ascending: true });
+    const { data, error } = await client.from('assets').select('*').is('deleted_at', null).order('created_at', { ascending: true });
+    fail(error);
+    return data;
+  }
+  async function listDeletedAssets() {
+    await requireOwner();
+    const { data, error } = await client.from('assets').select('*').not('deleted_at', 'is', null).order('deleted_at', { ascending: false });
     fail(error);
     return data;
   }
   async function createAsset(asset) {
+    await requireOwner();
     const { data, error } = await client.from('assets').insert({ id: uuid(asset.id || crypto.randomUUID()), ...assetFields(asset) }).select().single();
     fail(error);
     return data;
   }
   async function saveAsset(asset) {
+    await requireOwner();
     const { data, error } = await client.from('assets').update(assetFields(asset)).eq('id', uuid(asset.id)).select().single();
     fail(error);
     return data;
@@ -180,8 +192,29 @@ export function createCloud(config) {
     fail(error);
     return data;
   }
-  async function reviewAsset(assetId, status) {
-    const { data, error } = await client.rpc('review_asset', { p_asset_id: uuid(assetId), p_status: status });
+  async function reviewAsset(assetId, status, versionId) {
+    await requireReviewer();
+    const { data, error } = await client.rpc('review_asset', {
+      p_asset_id: uuid(assetId), p_status: status, p_version_id: uuid(versionId, 'version_id'),
+    });
+    fail(error);
+    return data;
+  }
+  async function markRead(assetId, versionId) {
+    await requireReviewer();
+    const { data, error } = await client.rpc('mark_asset_read', { p_asset_id: uuid(assetId), p_version_id: uuid(versionId, 'version_id') });
+    fail(error);
+    return data;
+  }
+  async function softDeleteAsset(id) {
+    await requireOwner();
+    const { data, error } = await client.rpc('soft_delete_asset', { p_asset_id: uuid(id) });
+    fail(error);
+    return data;
+  }
+  async function restoreAsset(id) {
+    await requireOwner();
+    const { data, error } = await client.rpc('restore_asset', { p_asset_id: uuid(id) });
     fail(error);
     return data;
   }
@@ -215,8 +248,8 @@ export function createCloud(config) {
     return data;
   }
   return {
-    client, getSession, role, listAssets, createAsset, saveAsset, listVersions, uploadVersion,
-    downloadVersion, listComments, addComment, reviewAsset, createReviewLink, revokeReviewLink,
+    client, getSession, role, listAssets, listDeletedAssets, createAsset, saveAsset, listVersions, uploadVersion,
+    downloadVersion, listComments, addComment, reviewAsset, markRead, softDeleteAsset, restoreAsset, createReviewLink, revokeReviewLink,
     signIn: async (email) => {
       const redirect = new URL(location.href); redirect.hash = ''; redirect.search = '';
       const { data, error } = await client.auth.signInWithOtp({ email, options: { shouldCreateUser: false, emailRedirectTo: redirect.href } });
