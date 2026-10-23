@@ -1,4 +1,5 @@
 import './style.css';
+import './dark.css';
 import { ReviewViewer } from './viewer.js';
 import { db } from './local-db.js';
 import { validateFiles } from './validation.js';
@@ -23,7 +24,7 @@ let toastTimer, loadSerial=0;
 function toast(message){const el=document.querySelector('#toast');el.textContent=message;el.classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('visible'),5500);}
 const run=fn=>async(...args)=>{try{return await fn(...args);}catch(e){console.error(e);toast(e.message||'操作失败，请稍后重试。');}};
 function postalArt(kind='scene'){
-  const colors={scene:'#dce5d8',character:'#e8dfd0',product:'#dbe7e2',animation:'#e4e4d7',vfx:'#e3dfe9'},bg=colors[kind]||colors.scene;
+  const colors={scene:'#243a30',character:'#39352c',product:'#223b34',animation:'#30392d',vfx:'#342d40'},bg=colors[kind]||colors.scene;
   let shape='';
   if(kind==='product')shape='<path d="M111 143h94v67h-94z" fill="#28483c"/><path d="M119 79a39 39 0 0 1 78 0v104h-78z" fill="#507761"/><path d="M130 104h56v7h-56z" fill="#1f3d34"/><path d="M132 135h52v39h-52z" fill="#e4cc9e"/><path d="M140 146h36l-18 14z" fill="#c8784e"/><circle cx="180" cy="164" r="3" fill="#28483c"/>';
   else if(kind==='character')shape='<ellipse cx="158" cy="76" rx="24" ry="28" fill="#e6cba4"/><path d="M124 63h70l-12-19h-46z" fill="#365c49"/><path d="M137 100l-18 77 39 11 39-11-18-77z" fill="#426853"/><path d="M139 178v34h15v-32 M164 180v32h15v-34" fill="#344c40"/><path d="M179 123l24 7-6 37-28-7z" fill="#ac794e"/><path d="M143 105l38 54" stroke="#d5ae74" stroke-width="6"/>';

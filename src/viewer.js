@@ -31,7 +31,7 @@ export class ReviewViewer {
   constructor(container,onUpdate=()=>{}) {
     this.container=container;this.onUpdate=onUpdate;this.urls=[];this.helpers=[];this.mode='material';this.playing=false;this.speed=1;this.frame=0;this.dead=false;this.clips=[];
     this.renderer=new THREE.WebGLRenderer({antialias:true,alpha:false,preserveDrawingBuffer:true});
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio,2));this.renderer.setClearColor(0xe9eae3);this.renderer.outputColorSpace=THREE.SRGBColorSpace;
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio,2));this.renderer.setClearColor(0x141e1a);this.renderer.outputColorSpace=THREE.SRGBColorSpace;
     this.renderer.toneMapping=THREE.ACESFilmicToneMapping;this.renderer.toneMappingExposure=1.25;
     this.renderer.domElement.className='viewer-canvas';this.renderer.domElement.setAttribute('aria-label','可旋转缩放的三维模型预览');container.append(this.renderer.domElement);
     this.scene=new THREE.Scene();this.camera=new THREE.PerspectiveCamera(42,1,.01,10000);this.camera.position.set(5,3.5,5);
@@ -39,7 +39,7 @@ export class ReviewViewer {
     this.scene.add(new THREE.HemisphereLight(0xffffff,0x737c61,3));
     const key=new THREE.DirectionalLight(0xffe6c7,3.5);key.position.set(5,8,6);this.scene.add(key);
     const fill=new THREE.DirectionalLight(0xb6d6e6,2);fill.position.set(-6,3,-3);this.scene.add(fill);
-    this.grid=new THREE.GridHelper(20,20,0x9aa597,0xc4cbbf);this.grid.position.y=-.015;this.scene.add(this.grid);
+    this.grid=new THREE.GridHelper(20,20,0x4d6b5a,0x293f33);this.grid.position.y=-.015;this.scene.add(this.grid);
     this.resize=new ResizeObserver(()=>this.fitCanvas());this.resize.observe(container);this.clock=new THREE.Clock();
     this.loop=()=>{if(this.dead)return;this.frame=requestAnimationFrame(this.loop);const dt=Math.min(this.clock.getDelta(),.1);if(this.mixer&&this.playing)this.mixer.update(dt*this.speed);this.controls.update();this.skeleton?.update();this.renderer.render(this.scene,this.camera);};this.loop();
   }
@@ -79,11 +79,11 @@ export class ReviewViewer {
   setMode(mode){this.mode=mode;this.clearHelpers();this.root?.traverse(o=>{if(!o.isMesh)return;
     const old=o.material,original=this.originals.get(o.uuid);if(old!==original)for(const m of(Array.isArray(old)?old:[old]))m.dispose();
     if(mode==='normal')o.material=new THREE.MeshNormalMaterial({side:THREE.DoubleSide});
-    else if(mode==='wireframe')o.material=(Array.isArray(original)?original:[original]).map(m=>{const clone=m.clone();clone.wireframe=true;return clone;});
+    else if(mode==='wireframe')o.material=(Array.isArray(original)?original:[original]).map(m=>{const clone=m.clone();clone.wireframe=true;clone.map=null;clone.emissiveMap=null;clone.color?.set(0xadd7bf);clone.emissive?.set(0x2c4d3b);return clone;});
     else o.material=original;
   });}
   showNormals(on){this.clearHelpers();if(!on||!this.root)return;if(this.stats.skinned)throw Error('骨骼动画请使用“法向着色”。箭头仅适用于静态网格。');
-    this.root.traverse(o=>{if(o.isMesh&&o.geometry.getAttribute('normal')){const h=new VertexNormalsHelper(o,.07,0x497d5c);this.scene.add(h);this.helpers.push(h);}});
+    this.root.traverse(o=>{if(o.isMesh&&o.geometry.getAttribute('normal')){const h=new VertexNormalsHelper(o,.07,0x82cda2);this.scene.add(h);this.helpers.push(h);}});
   }
   clearHelpers(){for(const h of this.helpers){this.scene.remove(h);h.dispose();}this.helpers=[];if(this.skeleton){this.scene.remove(this.skeleton);this.skeleton.dispose();this.skeleton=null;}}
   showSkeleton(on){if(this.skeleton){this.scene.remove(this.skeleton);this.skeleton.dispose();this.skeleton=null;}if(on&&this.root){this.skeleton=new THREE.SkeletonHelper(this.root);this.scene.add(this.skeleton);}}
