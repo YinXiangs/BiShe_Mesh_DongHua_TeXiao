@@ -15,6 +15,69 @@ function harness(handler){
  const fetch=async(url,options)=>{const call={path:new URL(url).pathname+new URL(url).search,...options};calls.push(call);return handler(call,calls);};
  const api=createSharedApi(config,{storage,fetch,now:()=>NOW});return {api,storage,calls};
 }
+function readinessHarness(handler){
+ let clock=NOW,nextTimer=0;const timers=new Map(),calls=[],delays=[];
+ const api=createSharedApi(config,{storage:memoryStorage(),now:()=>clock,
+  setTimeout:(callback,milliseconds)=>{const id=++nextTimer;timers.set(id,{callback,milliseconds});return id;},
+  clearTimeout:id=>timers.delete(id),sleep:async(milliseconds,{signal}={})=>{assert(!signal?.aborted);delays.push(milliseconds);clock+=milliseconds;},
+  fetch:async(url,options)=>{
+   const call={path:new URL(url).pathname,...options};calls.push(call);
+   const expire=()=>{const pending=[...timers.values()][0];assert(pending);clock+=pending.milliseconds;pending.callback();};
+   return handler(call,calls,{expire,clock:()=>clock});
+  },
+ });return {api,calls,delays,clock:()=>clock,timers};
+}
+
+test('readiness retries only anonymous health GETs, then login is a single independent request',async()=>{
+ const healthy={ok:true,storageReady:true,version:'qixi-shared-v1'};let waits=0;
+ const {api,calls,delays,timers}=readinessHarness((call,all)=>{
+  if(call.path==='/api/login')return json(grant());
+  if(all.length===1)throw Error('cold service connection closed');
+  if(all.length===2)return new Response('<html>starting</html>',{status:503});
+  return json(healthy);
+ });
+ assert.deepEqual(await api.ensureReady({onWait:()=>waits++}),healthy);
+ assert.equal(calls.length,3);assert.equal(waits,3);assert.deepEqual(delays,[5000,5000]);assert.equal(timers.size,0);
+ assert(calls.every(call=>call.method==='GET'&&call.path==='/api/health'&&call.body===undefined&&call.credentials==='omit'&&!call.headers));
+ await api.loginWithCode('synthetic teacher');assert.equal(calls.filter(call=>call.method==='POST').length,1);assert.equal(calls.at(-1).path,'/api/login');
+});
+
+test('invalid JSON, wrong service identity and incomplete storage never authorize a login',async()=>{
+ const responses=[new Response('<html>starting</html>'),json({ok:true,storageReady:true,version:'other-service'}),json({ok:true,storageReady:false,version:'qixi-shared-v1'}),json({ok:true,storageReady:true,version:'qixi-shared-v1'})];
+ const {api,calls}=readinessHarness(()=>responses.shift());
+ await api.ensureReady();assert.equal(calls.length,4);assert(calls.every(call=>call.method==='GET'));assert.equal(await api.role(),null);
+});
+
+test('cold-start readiness has a ninety-second total bound even for immediate invalid health responses',async()=>{
+ const {api,calls,clock}=readinessHarness(()=>json({ok:true,storageReady:true,version:'wrong'}));
+ await assert.rejects(api.ensureReady(),error=>error.timeout&&error.message.includes('启动时间较长'));
+ assert.equal(clock()-NOW,90000);assert.equal(calls.length,18);assert(calls.every(call=>call.method==='GET'));assert.equal(await api.role(),null);
+});
+
+test('eight-second attempt deadline covers a hung fetch and a hung JSON body, aborting both before retry',async()=>{
+ const healthy={ok:true,storageReady:true,version:'qixi-shared-v1'};
+ const {api,calls,clock,timers}=readinessHarness((call,all,{expire})=>{
+  if(all.length===1){queueMicrotask(expire);return new Promise(()=>{});}
+  if(all.length===2)return {ok:true,json:()=>{queueMicrotask(expire);return new Promise(()=>{});}};
+  return json(healthy);
+ });
+ assert.deepEqual(await api.ensureReady(),healthy);assert.equal(calls.length,3);assert(calls[0].signal.aborted);assert(calls[1].signal.aborted);assert.equal(clock()-NOW,26000);assert.equal(timers.size,0);
+});
+
+test('fetch AbortError from an internal attempt timeout is retried rather than treated as caller cancellation',async()=>{
+ const {api,calls}=readinessHarness((call,all,{expire})=>{
+  if(all.length===1)return new Promise((_,reject)=>{call.signal.addEventListener('abort',()=>reject(Object.assign(Error('fetch was aborted'),{name:'AbortError'})),{once:true});queueMicrotask(expire);});
+  return json({ok:true,storageReady:true,version:'qixi-shared-v1'});
+ });
+ assert.equal((await api.ensureReady()).ok,true);assert.equal(calls.length,2);assert(calls[0].signal.aborted);
+});
+
+test('real readiness access errors and caller cancellation are returned without login or repeated mutations',async()=>{
+ const denied=readinessHarness(()=>json({error:'service access denied'},401));
+ await assert.rejects(denied.api.ensureReady(),error=>error.status===401&&error.message==='service access denied');assert.equal(denied.calls.length,1);assert.equal(denied.timers.size,0);
+ const controller=new AbortController();const cancelled=readinessHarness(()=>{controller.abort();return new Promise(()=>{});});
+ await assert.rejects(cancelled.api.ensureReady({signal:controller.signal}),error=>error.name==='AbortError');assert.equal(cancelled.calls.length,1);assert.equal(cancelled.timers.size,0);
+});
 
 test('server authentication uses expiring Bearer session, never browser cookies or a local role as authority',async()=>{
  const {api,calls,storage}=harness(call=>call.path==='/api/login'?json(grant()):call.path==='/api/session'?json({role:'student',expiresAt:grant().expiresAt}):json({assets:[]}));

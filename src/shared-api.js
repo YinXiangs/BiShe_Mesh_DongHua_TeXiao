@@ -35,6 +35,15 @@ export function createSharedApi(config, options = {}) {
   const base = url.href.replace(/\/$/, '') + '/api';
   const fetcher = options.fetch || globalThis.fetch.bind(globalThis);
   const now = options.now || Date.now;
+  const schedule = options.setTimeout || globalThis.setTimeout;
+  const unschedule = options.clearTimeout || globalThis.clearTimeout;
+  const cancelled = () => Object.assign(Error('已取消连接共享服务。'), { name: 'AbortError' });
+  const sleep = options.sleep || ((milliseconds, { signal } = {}) => new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(cancelled()); return; }
+    const abort = () => { unschedule(timer); reject(cancelled()); };
+    const timer = schedule(() => { signal?.removeEventListener('abort', abort); resolve(); }, milliseconds);
+    signal?.addEventListener('abort', abort, { once: true });
+  }));
   let storage = options.storage;
   if (storage === undefined) { try { storage = globalThis.sessionStorage; } catch { storage = null; } }
   const key = SESSION_KEY + base;
@@ -80,6 +89,50 @@ export function createSharedApi(config, options = {}) {
       try { savedGrant(grant); } catch (error) { await request('/logout', { method: 'POST', token: grant.token }).catch(() => {}); throw error; }
     }
     return grant;
+  }
+  async function ensureReady({ onWait, signal } = {}) {
+    const deadline = now() + 90_000;
+    let lastError;
+    // Only this anonymous, read-only endpoint is retried. Authentication and review
+    // mutations remain single requests and never run before readiness is confirmed.
+    while (now() < deadline) {
+      if (signal?.aborted) throw cancelled();
+      onWait?.();
+      const controller = new AbortController();
+      const attemptMilliseconds = Math.min(8_000, deadline - now());
+      let timer, abort;
+      const limit = new Promise((_, reject) => {
+        timer = schedule(() => { controller.abort(); reject(Object.assign(Error('共享服务启动响应超时。'), { timeout: true })); }, attemptMilliseconds);
+        abort = () => { controller.abort(); reject(cancelled()); };
+        signal?.addEventListener('abort', abort, { once: true });
+      });
+      try {
+        const operation = (async () => {
+          const response = await fetcher(base + '/health', { method: 'GET', cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal });
+          if (!response.ok) {
+            let detail; try { detail = await response.json(); } catch { /* Startup pages can contain HTML. */ }
+            throw Object.assign(Error(detail?.error || '共享服务暂时无法连接（' + response.status + '）。'), { status: response.status });
+          }
+          const health = await response.json();
+          if (health?.ok !== true || health?.storageReady !== true || health?.version !== 'qixi-shared-v1') throw Error('共享服务尚未完成启动，请稍候。');
+          return health;
+        })();
+        return await Promise.race([operation, limit]);
+      } catch (error) {
+        // fetch can surface AbortError before the attempt timer's rejection. An
+        // internal timeout still retries; only the caller's cancellation stops.
+        if (signal?.aborted) throw cancelled();
+        // A real access/configuration error must be displayed, not disguised as a cold start.
+        if (error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status)) throw error;
+        lastError = error;
+      } finally {
+        unschedule(timer); signal?.removeEventListener('abort', abort);
+      }
+      const remaining = deadline - now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(5_000, remaining), { signal });
+    }
+    throw Object.assign(Error('共享服务启动时间较长，请稍后重新点击“进入网站”。', { cause: lastError }), { timeout: true });
   }
   async function getSession() {
     if (!validSession(session)) { clear(); return null; }
@@ -153,7 +206,7 @@ export function createSharedApi(config, options = {}) {
     return files;
   }
   return {
-    provider: 'shared-api', getSession, role, loginWithCode, logout, logoutToken, signOut: logout,
+    provider: 'shared-api', getSession, role, ensureReady, loginWithCode, logout, logoutToken, signOut: logout,
     listAssets, listDeletedAssets: async () => (await request('/assets?deleted=1')).assets,
     createAsset: async ({ id, title, category, description }) => unwrap(await request('/assets', { method: 'POST', json: { id, title, category, description } }), 'asset'),
     saveAsset: async ({ id, title, description }) => unwrap(await request('/assets/' + uuid(id), { method: 'PATCH', json: { title, description } }), 'asset'),

@@ -71,15 +71,19 @@ function renderAccess(){
  form.querySelector('.access-error').textContent=state.booting?'正在连接共享评审服务…':state.accessError||'';
  form.onsubmit=async event=>{
   event.preventDefault();const button=form.querySelector('button'),input=form.elements.password,error=form.querySelector('.access-error');button.disabled=true;error.textContent='';
+  const readiness=new AbortController(),watcher=new MutationObserver(()=>{if(!form.isConnected)readiness.abort();});watcher.observe(app,{childList:true,subtree:true});
   try{
    if(!state.serviceReady||!state.cloud)throw Error(state.accessError||'共享服务尚未连接，请刷新后重试。');
+   await state.cloud.ensureReady({signal:readiness.signal,onWait:()=>{if(form.isConnected){error.textContent='共享服务正在启动，请稍候…';button.textContent='正在连接共享服务…';}}});
+   if(!form.isConnected)return;
+   error.textContent='';button.textContent='正在登录…';
    const grant=await state.cloud.loginWithCode(input.value);input.value='';const role=grant.role;
    if(!saveEntrySession(role))throw Error('浏览器禁止保存当前会话，请允许此网站使用会话存储后重试。');
    state.entryRole=role;state.role=role==='student'?'owner':'reviewer';state.assetsReady=false;try{sessionStorage.removeItem(migrationPromptKey());}catch{}await refresh();
    if(role==='teacher'&&!state.accessError)dialog('欢迎黄静妮教授登陆网站！','<div class="welcome-panel"><div class="welcome-symbol">'+ico('mail')+'</div><h2 class="welcome-cn">欢迎黄静妮教授登陆网站！</h2><p class="welcome-en" lang="en">Welcome, Professor Huang Jingni!</p><p>期待您的指导，让每一份作品继续成长。</p><p class="help-text">作品、检查状态与意见在手机和电脑间共享。</p><button class="button primary" id="welcome-start">开始检查作品</button></div>').querySelector('#welcome-start').onclick=event=>event.target.closest('dialog').close();
    else if(role==='student')await maybePromptLegacyMigration();
-  }catch(e){if(form.isConnected)error.textContent=e.message||'暂时无法进入，请稍后重试。';else toast(e.message);}
-  finally{button.disabled=false;}
+  }catch(e){if(e.name!=='AbortError'){if(form.isConnected)error.textContent=e.message||'暂时无法进入，请稍后重试。';else toast(e.message);}}
+  finally{watcher.disconnect();readiness.abort();button.disabled=false;if(form.isConnected)button.innerHTML='进入网站 '+ico('arrow');}
  };
 }
 function leaveSession({revoke=true}={}){
