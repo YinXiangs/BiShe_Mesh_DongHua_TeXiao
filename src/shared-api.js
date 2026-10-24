@@ -304,8 +304,11 @@ export function createSharedApi(config, options = {}) {
       const preview = previews[index];
       const file = version.files?.find(file => file.name === preview.name && /\.(jpe?g|png)$/i.test(file.name));
       if (!file || !(preview.blob instanceof Blob) || preview.blob.type !== 'image/jpeg' || !preview.blob.size || preview.blob.size > PREVIEW_MAX_BYTES) throw Error('轻量评审图片无效。');
-      try { await request('/files/' + encodeURIComponent(file.id) + '/preview', { method: 'PUT', body: preview.blob }); }
+      const controller = new AbortController(); let timer;
+      const deadline = new Promise((_, reject) => { timer = schedule(() => { controller.abort(); reject(Object.assign(Error('快速评审图上传超时，原件版本已保留。'), { timeout: true })); }, 30_000); });
+      try { await Promise.race([request('/files/' + encodeURIComponent(file.id) + '/preview', { method: 'PUT', body: preview.blob, signal: controller.signal }), deadline]); }
       catch (error) { if (error.status === 401 || error.status === 403) throw error; failures.push(preview.name); }
+      finally { unschedule(timer); }
       onProgress?.({ completed: index + 1, total: previews.length });
     }
     return { failures };

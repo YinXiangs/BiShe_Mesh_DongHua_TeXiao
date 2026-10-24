@@ -347,3 +347,16 @@ test('derived previews upload separately from committed source files and cannot 
  assert.equal(calls.at(-1).path,'/api/files/'+V+'/preview');assert.equal(calls.at(-1).method,'PUT');assert.equal(calls.at(-1).body,blob);
  await assert.rejects(api.uploadImagePreviews({files:[{...metadata,name:'source.fbx'}]},[{name:'source.fbx',blob}]),/无效/);
 });
+
+test('an optional preview PUT has a whole-request deadline, preserves the saved version and does not block remaining previews',async()=>{
+ let expire;const timers=new Set();
+ const {api,calls}=harness(call=>{
+  if(call.path==='/api/login')return json(grant());
+  queueMicrotask(()=>expire());return new Promise(()=>{});
+ },{setTimeout:(callback,ms)=>{assert.equal(ms,30000);expire=callback;timers.add(callback);return callback;},clearTimeout:id=>timers.delete(id)});
+ await api.loginWithCode('synthetic');
+ const metadata={id:V,name:'front.png',size:1_500_000,type:'image/png'},blob=new Blob(['jpeg'],{type:'image/jpeg'});
+ const result=await api.uploadImagePreviews({id:V,files:[metadata]},[{name:metadata.name,blob}]);
+ assert.deepEqual(result,{failures:['front.png']});assert(calls.at(-1).signal.aborted);assert.equal(timers.size,0);
+ assert.equal(calls.length,2);assert(calls.every(call=>call.method!=='DELETE'));
+});

@@ -142,7 +142,7 @@ function thumbnailFrom(source, width, height) {
 // A separate JPEG keeps every review page at 1920×1080 while preserving the
 // submitted PNG/JPG. Neither the FBX nor the original image is replaced.
 export async function encodeReviewPreview(canvas, { signal } = {}) {
-  for (const quality of [0.78, 0.65, 0.5, 0.36]) {
+  for (const quality of [0.78, 0.65, 0.5, 0.36, 0.22, 0.12]) {
     checkSignal(signal);
     const blob = await bounded(new Promise((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(Error('评审图片编码失败。')), 'image/jpeg', quality)), { signal });
     checkSignal(signal);
