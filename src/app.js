@@ -1,16 +1,15 @@
 import './style.css';
 import './dark.css';
 import './access.css';
-import { ReviewViewer } from './viewer.js';
-import { PREVIEW_REVISION } from './material-preview.js';
 import { buildReviewRecord, formatReviewRecordText } from './review-records.js';
 import { db } from './local-db.js';
 import { validateFiles } from './validation.js';
 import { createSharedApi, planLegacyVersions } from './shared-api.js';
-import { generateMediaThumbnail } from './thumbnails.js';
+import { prepareSubmissionMedia } from './submission-media.js';
+import { MediaReview, planReviewMedia } from './media-review.js';
+import './media-review.css';
 import { readPreview, writePreview, validPreview } from './preview-cache.js';
 import { readEntrySession, saveEntrySession, clearEntrySession, submissionAllowed, reviewAllowed } from './access.js';
-import { zipSync } from 'fflate';
 
 const CATS={all:'全部作品',scene:'场景建模',character:'角色建模',product:'产品建模',animation:'游戏动画',vfx:'游戏特效'};
 const STATUS={pending:'制作中',review:'待检查',changes:'待修改',approved:'已通过'};
@@ -26,7 +25,7 @@ const demoSpecs=[['scene','邮局主建筑','木屋、门廊与信件投递区',
 const DEMOS=demoSpecs.map(([category,title,description,status],i)=>({id:'demo-'+i,category,title,description,status,demo:true,created_at:new Date().toISOString()}));
 const state={assets:[],category:'all',status:'all',query:'',mode:'cloud',demo:false,cloud:null,role:null,config:{githubRepo:'YinXiangs/BiShe_Mesh_DongHua_TeXiao'},deployedConfig:null,accessError:null,shared:null,token:null,selected:null,versions:[],comments:[],files:[],viewer:null,video:null,version:null,serviceReady:false,booting:true,assetsReady:false,legacyAssets:[],migrationBusy:false};
 const app=document.querySelector('#app');
-state.entryRole=null;
+state.entryRole=null;state.media=null;state.downloadController=null;
 let toastTimer, loadSerial=0, feedbackMutationSerial=0, feedbackWrites=0;
 let previewObserver,previewQueue=Promise.resolve();
 const assetPreviews=new Map();
@@ -92,6 +91,7 @@ function leaveSession({revoke=true}={}){
  clearEntrySession();state.entryRole=null;loadSerial++;
  for(const d of document.querySelectorAll('dialog'))d.close();
  state.viewer?.destroy();state.viewer=null;if(state.video){state.video.pause();URL.revokeObjectURL(state.video.src);state.video=null;}
+ state.media?.destroy();state.media=null;state.downloadController?.abort();state.downloadController=null;
  state.selected=null;state.files=[];state.versions=[];state.comments=[];state.version=null;state.assets=[];state.role=null;state.assetsReady=false;state.legacyAssets=[];assetPreviews.clear();renderAccess();
 }
 function readMarkup(asset){
@@ -141,8 +141,9 @@ function previewMarkup(asset){
  const preview=assetPreviews.get(previewKey(asset));
  if(preview?.thumbnail)return '<img alt="'+esc(asset.title)+' · 最新提交预览" src="'+esc(preview.thumbnail)+'" loading="lazy">';
  if(preview?.empty)return postalArt(asset.category);
+ if(preview?.missing)return '<span class="preview-message">待补充图片或视频</span>';
  if(preview?.error)return '<span class="preview-message">'+ico('grid')+'<span>文件已提交<br>预览暂不可用</span></span>';
- return '<span class="preview-message loading">正在生成预览…</span>';
+ return '<span class="preview-message loading">正在读取封面…</span>';
 }
 function updatePreviewCard(asset,key){
  if(previewKey(asset)!==key)return;
@@ -154,26 +155,18 @@ async function ensureAssetPreview(asset){
  if(asset.demo||assetPreviews.has(key))return;
  const pending={};assetPreviews.set(key,pending);
  const job=async()=>{
- if(assetPreviews.get(key)!==pending)return;
- if(previewKey(asset)!==key){assetPreviews.delete(key);return;}
- try{
-  const versions=await source.cloud.listVersions(asset.id);
-  const version=[...versions].sort((a,b)=>b.number-a.number)[0];
-  if(!version){pending.empty=true;return;}
-  pending.versionId=version.id;
-  let thumbnail=validPreview(version.stats?.thumbnail)&&(asset.category==='vfx'||version.stats?.previewRevision===PREVIEW_REVISION)?version.stats.thumbnail:await readPreview(source.scope,version.id);
-  if(!thumbnail){
-   const files=await source.cloud.downloadVersion(version);
-   if(!files.length||files.every(file=>!file.size)){pending.empty=true;return;}
-   thumbnail=(await generateMediaThumbnail(files,asset.category)).thumbnail;
-   await writePreview(source.scope,version.id,thumbnail);
-  }
-  pending.thumbnail=thumbnail;
- }catch(error){pending.error=error.message||'无法生成预览';}
- finally{if(assetPreviews.get(key)===pending)updatePreviewCard(asset,key);}
+  if(assetPreviews.get(key)!==pending||previewKey(asset)!==key)return;
+  try{
+   const versions=await source.cloud.listVersions(asset.id),version=[...versions].sort((a,b)=>b.number-a.number)[0];
+   if(!version){pending.empty=true;return;}
+   pending.versionId=version.id;
+   // Existing saved covers are metadata. Never download a model to create one.
+   const thumbnail=validPreview(version.stats?.thumbnail)?version.stats.thumbnail:await readPreview(source.scope,version.id);
+   if(thumbnail)pending.thumbnail=thumbnail;else pending.missing=true;
+  }catch(error){pending.error=error.message||'无法读取封面';}
+  finally{if(assetPreviews.get(key)===pending)updatePreviewCard(asset,key);}
  };
- previewQueue=previewQueue.then(job,job);
- await previewQueue;
+ previewQueue=previewQueue.then(job,job);await previewQueue;
 }
 function observeAssetPreviews(){
  previewObserver?.disconnect();
@@ -188,9 +181,9 @@ function render(){
  if(readEntrySession()!==state.entryRole){leaveSession();return;}
  const rows=currentAssets(),filtered=rows.filter(a=>(state.category==='all'||a.category===state.category)&&(state.status==='all'||a.status===state.status)&&(a.title+' '+a.description).toLowerCase().includes(state.query.toLowerCase()));
  const mode='共享评审';
- app.innerHTML='<div class="app-shell"><aside class="sidebar"><a class="brand" href="./"><span class="brand-icon">'+ico('mail')+'</span><span>栖息邮局<small>毕业设计 · 评审工作台</small></span></a><div class="sidebar-note">作品目录 <span>WORKSPACE</span></div><nav class="nav-list" aria-label="作品分类">'+Object.entries(CATS).map(([k,v])=>'<button class="nav-item '+(state.category===k?'active':'')+'" data-category="'+k+'">'+ico(k==='all'?'grid':k)+'<span class="nav-label">'+v+'</span><span class="nav-count">'+rows.filter(a=>k==='all'||a.category===k).length+'</span></button>').join('')+'</nav><div class="sidebar-bottom"><div class="sidebar-note">让每一次反馈<br>成为下一步的方向。</div><button class="nav-item" id="help">'+ico('chat')+'<span>使用与检查说明</span></button><button class="nav-item" id="settings">'+ico('settings')+'<span>连接与账户</span></button><a class="nav-item" href="https://github.com/YinXiangs/BiShe_Mesh_DongHua_TeXiao" target="_blank" rel="noreferrer">'+ico('link')+'<span>项目 GitHub 仓库</span></a></div></aside><main class="main"><header class="topbar"><div class="breadcrumb">毕业设计 <span>/</span> '+esc(CATS[state.category])+'</div><div class="top-actions session-actions"><span class="identity-chip">'+(state.entryRole==='teacher'?'教师端':'学生端')+'</span><span class="mode-pill">'+mode+'</span><button class="button ghost small" id="leave-session">退出登录</button>'+'</div></header><section class="hero"><div class="hero-copy"><div class="eyebrow">QIXI POST OFFICE · GRADUATION PROJECT</div><h1>把每一份用心，<br>寄往下一次进步。</h1><p>《栖息邮局》作品提交与指导记录<br>模型、动画与特效，在这里有序生长。</p><div class="hero-actions">'+(!canEdit()?'<span class="help-text">打开作品即可查看版本、检查模型并留下意见。</span>':'<button class="button primary" id="new-asset">'+ico('plus')+' 新增作品</button><button class="button ghost" id="share-project">'+ico('link')+' 邀请老师评审</button>')+'</div></div><div class="hero-art">'+postalArt('scene')+'<span class="hero-stamp">用心制作 · 持续生长</span></div></section><section class="stats-grid" aria-label="项目概览">'+[['grid','作品总数',rows.length],['clock','待老师检查',rows.filter(a=>a.status==='review').length],['chat','需要修改',rows.filter(a=>a.status==='changes').length],['check','检查已通过',rows.filter(a=>a.status==='approved').length]].map(([i,t,n])=>'<div class="stat-card"><span class="stat-icon">'+ico(i)+'</span><div><div class="stat-value">'+n+'<small> 件</small></div><div class="stat-label">'+t+'</div></div></div>').join('')+'</section>'+
+ app.innerHTML='<div class="app-shell"><aside class="sidebar"><a class="brand" href="./"><span class="brand-icon">'+ico('mail')+'</span><span>栖息邮局<small>毕业设计 · 评审工作台</small></span></a><div class="sidebar-note">作品目录 <span>WORKSPACE</span></div><nav class="nav-list" aria-label="作品分类">'+Object.entries(CATS).map(([k,v])=>'<button class="nav-item '+(state.category===k?'active':'')+'" data-category="'+k+'">'+ico(k==='all'?'grid':k)+'<span class="nav-label">'+v+'</span><span class="nav-count">'+rows.filter(a=>k==='all'||a.category===k).length+'</span></button>').join('')+'</nav><div class="sidebar-bottom"><div class="sidebar-note">让每一次反馈<br>成为下一步的方向。</div><button class="nav-item" id="help">'+ico('chat')+'<span>使用与检查说明</span></button><button class="nav-item" id="settings">'+ico('settings')+'<span>连接与账户</span></button><a class="nav-item" href="https://github.com/YinXiangs/BiShe_Mesh_DongHua_TeXiao" target="_blank" rel="noreferrer">'+ico('link')+'<span>项目 GitHub 仓库</span></a></div></aside><main class="main"><header class="topbar"><div class="breadcrumb">毕业设计 <span>/</span> '+esc(CATS[state.category])+'</div><div class="top-actions session-actions"><span class="identity-chip">'+(state.entryRole==='teacher'?'教师端':'学生端')+'</span><span class="mode-pill">'+mode+'</span><button class="button ghost small" id="leave-session">退出登录</button>'+'</div></header><section class="hero"><div class="hero-copy"><div class="eyebrow">QIXI POST OFFICE · GRADUATION PROJECT</div><h1>把每一份用心，<br>寄往下一次进步。</h1><p>《栖息邮局》作品提交与指导记录<br>模型、动画与特效，在这里有序生长。</p><div class="hero-actions">'+(!canEdit()?'<span class="help-text">打开图片翻页检查，或播放视频并留下意见。</span>':'<button class="button primary" id="new-asset">'+ico('plus')+' 新增作品</button><button class="button ghost" id="share-project">'+ico('link')+' 邀请老师评审</button>')+'</div></div><div class="hero-art">'+postalArt('scene')+'<span class="hero-stamp">用心制作 · 持续生长</span></div></section><section class="stats-grid" aria-label="项目概览">'+[['grid','作品总数',rows.length],['clock','待老师检查',rows.filter(a=>a.status==='review').length],['chat','需要修改',rows.filter(a=>a.status==='changes').length],['check','检查已通过',rows.filter(a=>a.status==='approved').length]].map(([i,t,n])=>'<div class="stat-card"><span class="stat-icon">'+ico(i)+'</span><div><div class="stat-value">'+n+'<small> 件</small></div><div class="stat-label">'+t+'</div></div></div>').join('')+'</section>'+
  (state.accessError?'<div class="notice" role="alert">'+ico('link')+'<span><strong>共享服务暂时无法连接</strong><br>'+esc(state.accessError)+'</span><button class="button ghost small" id="retry-access">重试</button></div>':'')+
- '<section><div class="section-head"><div><h2>'+esc(CATS[state.category])+' <span class="help-text">/ '+filtered.length+' 件</span></h2><p>每一项作品，都有独立的版本与反馈记录。</p></div><label class="search-field">'+ico('search')+'<input id="search" type="search" aria-label="搜索作品" placeholder="搜索作品名称…" value="'+esc(state.query)+'"></label></div><div class="filters">'+[['all','全部状态'],...Object.entries(STATUS)].map(([k,v])=>'<button class="filter-chip '+(state.status===k?'active':'')+'" data-status="'+k+'">'+v+'</button>').join('')+'</div><div class="asset-grid">'+filtered.map(a=>'<article class="asset-card"><button class="asset-thumb" data-open="'+esc(a.id)+'" aria-label="检查'+esc(a.title)+'">'+'<span class="asset-preview">'+previewMarkup(a)+'</span>'+'<span class="asset-category">'+CATS[a.category]+'</span>'+(a.demo?'<span class="badge demo">演示</span>':'')+'</button><div class="asset-body"><div class="asset-meta"><span>'+((a.category==='vfx')?'MP4 · 特效视频':'FBX · '+(a.category==='animation'?'动画文件':'三维模型'))+'</span><span class="badge '+a.status+'">'+STATUS[a.status]+'</span></div><div class="asset-read" data-read>'+readMarkup(a)+'</div><h3 class="asset-title">'+esc(a.title)+'</h3><p class="asset-description">'+esc(a.description||'等待补充制作说明')+'</p><div class="asset-footer"><span>'+ (a.demo?'示例预览':'更新于 '+date(a.updated_at||a.created_at))+'</span><button class="button ghost small" data-open="'+esc(a.id)+'">进入检查 '+ico('arrow')+'</button></div></div></article>').join('')+'</div>'+(!filtered.length?'<div class="empty-state">'+ico('mail')+'<h3>这里还没有作品</h3><p>学生提交作品后，即可在这里预览与检查。</p>'+(canEdit()?'<button class="button primary" id="empty-add">新增第一件作品</button>':'')+'</div>':'')+'</section><footer class="page-footer">栖息邮局 · 毕业设计评审工作台 <span>每次提交，离完成更近一步。</span></footer></main></div>';
+ '<section><div class="section-head"><div><h2>'+esc(CATS[state.category])+' <span class="help-text">/ '+filtered.length+' 件</span></h2><p>每一项作品，都有独立的版本与反馈记录。</p></div><label class="search-field">'+ico('search')+'<input id="search" type="search" aria-label="搜索作品" placeholder="搜索作品名称…" value="'+esc(state.query)+'"></label></div><div class="filters">'+[['all','全部状态'],...Object.entries(STATUS)].map(([k,v])=>'<button class="filter-chip '+(state.status===k?'active':'')+'" data-status="'+k+'">'+v+'</button>').join('')+'</div><div class="asset-grid">'+filtered.map(a=>'<article class="asset-card"><button class="asset-thumb" data-open="'+esc(a.id)+'" aria-label="检查'+esc(a.title)+'">'+'<span class="asset-preview">'+previewMarkup(a)+'</span>'+'<span class="asset-category">'+CATS[a.category]+'</span>'+(a.demo?'<span class="badge demo">演示</span>':'')+'</button><div class="asset-body"><div class="asset-meta"><span>'+(['animation','vfx'].includes(a.category)?'MP4 · 视频评审':'JPG / PNG · 图片评审')+'</span><span class="badge '+a.status+'">'+STATUS[a.status]+'</span></div><div class="asset-read" data-read>'+readMarkup(a)+'</div><h3 class="asset-title">'+esc(a.title)+'</h3><p class="asset-description">'+esc(a.description||'等待补充制作说明')+'</p><div class="asset-footer"><span>'+ (a.demo?'示例预览':'更新于 '+date(a.updated_at||a.created_at))+'</span><button class="button ghost small" data-open="'+esc(a.id)+'">进入检查 '+ico('arrow')+'</button></div></div></article>').join('')+'</div>'+(!filtered.length?'<div class="empty-state">'+ico('mail')+'<h3>这里还没有作品</h3><p>学生提交作品后，即可在这里预览与检查。</p>'+(canEdit()?'<button class="button primary" id="empty-add">新增第一件作品</button>':'')+'</div>':'')+'</section><footer class="page-footer">栖息邮局 · 毕业设计评审工作台 <span>每次提交，离完成更近一步。</span></footer></main></div>';
  app.querySelectorAll('[data-category]').forEach(b=>b.onclick=()=>{state.category=b.dataset.category;render();});
  app.querySelectorAll('[data-status]').forEach(b=>b.onclick=()=>{state.status=b.dataset.status;render();});
  app.querySelector('#search').oninput=e=>{const pos=e.target.selectionStart;state.query=e.target.value;render();const q=app.querySelector('#search');q.focus();q.setSelectionRange(pos,pos);};
@@ -221,12 +214,12 @@ function render(){
 }
 function dialog(title,body,wide=false){
  const d=document.createElement('dialog');d.className='dialog '+(wide?'detail-dialog':'');d.innerHTML='<div class="dialog-header"><div><h2>'+esc(title)+'</h2></div><button class="close-button" aria-label="关闭">'+ico('close')+'</button></div><div class="dialog-body">'+body+'</div>';document.body.append(d);
- d.querySelector('.close-button').onclick=()=>d.close();d.addEventListener('click',e=>{if(e.target===d)d.close();});d.addEventListener('close',()=>{if(wide){state.viewer?.destroy();state.viewer=null;if(state.video){state.video.pause();URL.revokeObjectURL(state.video.src);state.video=null;}}d.remove();},{once:true});d.showModal();return d;
+ d.querySelector('.close-button').onclick=()=>d.close();d.addEventListener('click',e=>{if(e.target===d&&!d.querySelector('.close-button').disabled)d.close();});d.addEventListener('close',()=>{if(wide){loadSerial++;state.media?.destroy();state.media=null;state.downloadController?.abort();state.downloadController=null;state.viewer?.destroy();state.viewer=null;if(state.video){state.video.pause();URL.revokeObjectURL(state.video.src);state.video=null;}}d.remove();},{once:true});d.showModal();return d;
 }
 function newAsset(){
  requireStudent();
  if(state.mode==='cloud'&&state.role!=='owner'){settings();return;}if(state.token)return;
- const d=dialog('新增作品','<form id="asset-form" class="form-grid"><label class="field">作品名称<input name="title" required maxlength="80" placeholder="例如：邮局主建筑"></label><label class="field">作品分类<select name="category">'+Object.entries(CATS).filter(([k])=>k!=='all').map(([k,v])=>'<option value="'+k+'" '+(state.category===k?'selected':'')+'>'+v+'</option>').join('')+'</select></label><label class="field">制作说明<textarea name="description" maxlength="3000" placeholder="写下本次想请老师重点检查的内容。"></textarea></label><p class="help-text">新增后可提交 FBX 模型／动画，或 MP4 特效视频。每类作品数量不限。</p><div class="form-actions"><button class="button primary">创建作品</button></div></form>');
+ const d=dialog('新增作品','<form id="asset-form" class="form-grid"><label class="field">作品名称<input name="title" required maxlength="80" placeholder="例如：邮局主建筑"></label><label class="field">作品分类<select name="category">'+Object.entries(CATS).filter(([k])=>k!=='all').map(([k,v])=>'<option value="'+k+'" '+(state.category===k?'selected':'')+'>'+v+'</option>').join('')+'</select></label><label class="field">制作说明<textarea name="description" maxlength="3000" placeholder="写下本次想请老师重点检查的内容。"></textarea></label><p class="help-text">模型提交最多 4 张 JPG / PNG；动画和特效提交 MP4。FBX 可作为下载附件。</p><div class="form-actions"><button class="button primary">创建作品</button></div></form>');
  d.querySelector('form').onsubmit=run(async e=>{e.preventDefault();requireStudent();const f=new FormData(e.target),title=f.get('title').trim();if(!title)throw Error('请填写作品名称。');const a={id:uid(),title,category:f.get('category'),description:f.get('description').trim(),status:'pending',created_at:new Date().toISOString(),updated_at:new Date().toISOString()};await state.cloud.createAsset(a);state.demo=false;state.category=a.category;state.status='all';state.query='';d.close();await refresh();await openAsset(a.id);toast('作品已创建，可以提交第一个版本。');});
 }
 async function openAsset(id){
@@ -235,7 +228,7 @@ async function openAsset(id){
  state.selected=currentAssets().find(a=>a.id===id);const a=state.selected;if(!a)return;
  state.versions=await state.cloud.listVersions(id);
  state.comments=await state.cloud.listComments(id);
- const d=dialog(a.title,'<div class="detail-layout"><section class="viewer-column"><div class="viewer-toolbar"><span class="badge '+a.status+'">'+STATUS[a.status]+'</span><div class="viewer-tools">'+(canEdit()&&!a.demo?'<button class="button primary small" id="upload-version">'+ico('upload')+' 提交新版本</button>':'')+'<button class="button ghost small" id="download-version">下载版本</button><button class="button ghost small" id="asset-share">评审链接</button></div></div><div class="viewer-shell"><div id="model-host" style="width:100%;height:100%;min-height:360px"></div><div class="viewer-overlay" id="view-label">'+(a.demo?'演示预览 · 非提交文件':'')+'</div></div><div id="view-controls"></div><div class="viewer-stats" id="model-stats"></div><div class="inspector-tabs" role="tablist"><button class="filter-chip active" data-tab="summary">检查说明</button><button class="filter-chip" data-tab="materials">材质</button><button class="filter-chip" data-tab="structure">结构</button></div><div class="inspector-panel" id="inspector"></div></section><aside class="review-column"><div class="review-header"><h3>版本与反馈</h3><p>'+esc(a.description||'从整体到细节，记录每一次进步。')+'</p><label class="field">当前检查版本<select id="versions">'+(state.versions.length?state.versions.map(v=>'<option value="'+esc(v.id)+'">V'+v.number+' · '+esc(v.filename)+'</option>').join(''):'<option>尚未提交</option>')+'</select></label>'+(canReview()&&!state.token&&!a.demo?'<label class="field">检查状态<select id="asset-status" class="review-status-select">'+Object.entries(STATUS).filter(([k])=>k!=='pending').map(([k,v])=>'<option value="'+k+'" '+(a.status===k?'selected':'')+'>'+v+'</option>').join('')+'</select></label>':'')+'</div><div class="comment-list" id="comments"></div><form class="comment-form" id="comment-form"><h4>留下检查意见</h4><label class="field">你的称呼<input name="author" required maxlength="40" placeholder="例如：张老师" autocomplete="name" value="'+esc(state.entryRole==='teacher'?'黄静妮教授':localStorage.getItem('qixi-author')||'')+'"></label><div class="form-grid" style="grid-template-columns:1fr 1fr"><label class="field">检查维度<select name="dimension">'+Object.entries(DIM).map(([k,v])=>'<option value="'+k+'">'+v+'</option>').join('')+'</select></label><label class="field">建议<select name="verdict"><option value="note">一般建议</option><option value="changes">建议修改</option><option value="approved">建议通过</option></select></label></div><label class="field">意见内容<textarea name="body" required maxlength="3000" placeholder="可以描述具体位置、问题与修改方向…"></textarea></label><p class="help-text">'+(state.token?'评语会保存到共享评审中。':state.mode==='cloud'?'意见将保存到共享评审。':'本机意见只保存在这台设备，不会自动发送到其他手机或电脑。')+' 记录当前版本及查看位置。</p><button class="button primary" '+(a.demo||!state.versions.length?'disabled':'')+'>提交意见 '+ico('arrow')+'</button></form></aside></div>',true);
+ const d=dialog(a.title,'<div class="detail-layout"><section class="viewer-column"><div class="viewer-toolbar"><span class="badge '+a.status+'">'+STATUS[a.status]+'</span><div class="viewer-tools">'+(canEdit()&&!a.demo?'<button class="button primary small" id="upload-version">'+ico('upload')+' 提交新版本</button>':'')+'<button class="button ghost small" id="download-version">下载 FBX</button><button class="button ghost small" id="asset-share">评审链接</button></div></div><div class="viewer-shell"><div id="model-host" style="width:100%;height:100%;min-height:360px"></div><div class="viewer-overlay" id="view-label">'+(a.demo?'演示预览 · 非提交文件':'')+'</div></div><div id="view-controls"></div><div class="viewer-stats" id="model-stats"></div><div class="inspector-tabs" role="tablist"><button class="filter-chip active" data-tab="summary">检查说明</button><button class="filter-chip" data-tab="files">提交文件</button></div><div class="inspector-panel" id="inspector"></div></section><aside class="review-column"><div class="review-header"><h3>版本与反馈</h3><p>'+esc(a.description||'从整体到细节，记录每一次进步。')+'</p><label class="field">当前检查版本<select id="versions">'+(state.versions.length?state.versions.map(v=>'<option value="'+esc(v.id)+'">V'+v.number+' · '+esc(v.filename)+'</option>').join(''):'<option>尚未提交</option>')+'</select></label>'+(canReview()&&!state.token&&!a.demo?'<label class="field">检查状态<select id="asset-status" class="review-status-select">'+Object.entries(STATUS).filter(([k])=>k!=='pending').map(([k,v])=>'<option value="'+k+'" '+(a.status===k?'selected':'')+'>'+v+'</option>').join('')+'</select></label>':'')+'</div><div class="comment-list" id="comments"></div><form class="comment-form" id="comment-form"><h4>留下检查意见</h4><label class="field">你的称呼<input name="author" required maxlength="40" placeholder="例如：张老师" autocomplete="name" value="'+esc(state.entryRole==='teacher'?'黄静妮教授':localStorage.getItem('qixi-author')||'')+'"></label><div class="form-grid" style="grid-template-columns:1fr 1fr"><label class="field">检查维度<select name="dimension">'+Object.entries(DIM).map(([k,v])=>'<option value="'+k+'">'+v+'</option>').join('')+'</select></label><label class="field">建议<select name="verdict"><option value="note">一般建议</option><option value="changes">建议修改</option><option value="approved">建议通过</option></select></label></div><label class="field">意见内容<textarea name="body" required maxlength="3000" placeholder="可以描述具体位置、问题与修改方向…"></textarea></label><p class="help-text">'+(state.token?'评语会保存到共享评审中。':state.mode==='cloud'?'意见将保存到共享评审。':'本机意见只保存在这台设备，不会自动发送到其他手机或电脑。')+' 记录当前版本及查看位置。</p><button class="button primary" '+(a.demo||!state.versions.length?'disabled':'')+'>提交意见 '+ico('arrow')+'</button></form></aside></div>',true);
  const feedbackTools=document.createElement('div');feedbackTools.className='feedback-actions';feedbackTools.innerHTML='<button class="button ghost small" type="button" id="refresh-feedback">刷新反馈</button><button class="button ghost small" type="button" id="export-feedback">导出评审记录</button>';
  const storageNote=document.createElement('p');storageNote.className='feedback-storage';storageNote.textContent='共享评审：作品、已读、检查状态与意见在手机和电脑间共享。';
  if(!a.demo){d.querySelector('.review-header').append(storageNote,feedbackTools);feedbackTools.querySelector('#export-feedback').onclick=run(()=>exportReviewRecords(a));feedbackTools.querySelector('#refresh-feedback').onclick=run(event=>refreshFeedback(d,a,event.target));}
@@ -245,93 +238,88 @@ async function openAsset(id){
  else d.querySelector('#asset-share').onclick=run(()=>share(a.id));
  d.querySelector('#comment-form').hidden=!canReview();
  if(canEdit()&&!a.demo){const remove=document.createElement('button');remove.className='button danger small';remove.textContent='删除作品';remove.onclick=()=>deleteAsset(a,d);d.querySelector('.viewer-tools').prepend(remove);const edit=document.createElement('button');edit.className='button ghost small';edit.textContent='编辑说明';edit.onclick=()=>editAsset(a,d);d.querySelector('.viewer-tools').prepend(edit);}
- d.querySelector('#download-version').onclick=run(downloadVersion);
+ d.querySelector('#download-version').onclick=run(event=>downloadVersion(event.currentTarget));
  d.querySelector('#asset-status')?.addEventListener('change',run(async e=>{const select=e.target,previous=a.status;select.disabled=true;feedbackWrites++;feedbackMutationSerial++;try{await changeReviewStatus(a,select.value);toast('检查状态已保存到共享评审。');}catch(error){select.value=previous;throw error;}finally{feedbackWrites--;feedbackMutationSerial++;select.disabled=Boolean(!canReview()||!state.version||state.version.id!==state.versions[0]?.id);}}));
  d.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{d.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));inspector(d,b.dataset.tab);});
- d.querySelector('#comment-form').onsubmit=run(async e=>{e.preventDefault();requireTeacher();if(!state.version||a.demo)return;const button=e.target.querySelector('button');button.disabled=true;feedbackWrites++;feedbackMutationSerial++;try{const f=new FormData(e.target),rawBody=f.get('body'),author=f.get('author').trim(),body=rawBody.trim();if(!author||!body)throw Error('请填写称呼与意见内容。');const c={id:uid(),asset_id:a.id,version_id:state.version.id,author_name:author,body,dimension:f.get('dimension'),verdict:f.get('verdict'),context:state.video?{time:state.video.currentTime}:state.viewer?.context()||{},created_at:new Date().toISOString()};const saved=await state.cloud.addComment(c);if(state.selected?.id===a.id&&!state.comments.some(row=>row.id===saved.id))state.comments.push(saved);try{localStorage.setItem('qixi-author',author);}catch{}if(state.version?.id===c.version_id&&e.target.elements.body.value===rawBody)e.target.elements.body.value='';if(d.isConnected)comments(d);toast('意见已保存到共享评审。');}finally{feedbackWrites--;feedbackMutationSerial++;button.disabled=Boolean(!canReview()||state.selected?.demo||!state.version);}});
+ d.querySelector('#comment-form').onsubmit=run(async e=>{e.preventDefault();requireTeacher();if(!state.version||a.demo)return;const button=e.target.querySelector('button');button.disabled=true;feedbackWrites++;feedbackMutationSerial++;try{const f=new FormData(e.target),rawBody=f.get('body'),author=f.get('author').trim(),body=rawBody.trim();if(!author||!body)throw Error('请填写称呼与意见内容。');const c={id:uid(),asset_id:a.id,version_id:state.version.id,author_name:author,body,dimension:f.get('dimension'),verdict:f.get('verdict'),context:state.media?.context()||{},created_at:new Date().toISOString()};const saved=await state.cloud.addComment(c);if(state.selected?.id===a.id&&!state.comments.some(row=>row.id===saved.id))state.comments.push(saved);try{localStorage.setItem('qixi-author',author);}catch{}if(state.version?.id===c.version_id&&e.target.elements.body.value===rawBody)e.target.elements.body.value='';if(d.isConnected)comments(d);toast('意见已保存到共享评审。');}finally{feedbackWrites--;feedbackMutationSerial++;button.disabled=Boolean(!canReview()||state.selected?.demo||!state.version);}});
  await loadVersion(d,state.versions[0]?.id);comments(d);
 }
 async function loadVersion(d,id){
  const request=++loadSerial,readingAsset=state.selected;
- state.viewer?.destroy();state.viewer=null;if(state.video){state.video.pause();URL.revokeObjectURL(state.video.src);state.video=null;}
- state.version=state.versions.find(v=>v.id===id);state.files=[];const host=d.querySelector('#model-host'),controls=d.querySelector('#view-controls');host.innerHTML='';controls.innerHTML='';d.querySelector('#model-stats').innerHTML='';state.stats=null;
+ state.media?.destroy();state.media=null;state.downloadController?.abort();state.downloadController=null;
+ state.version=state.versions.find(v=>v.id===id);state.files=[];state.stats=state.version?.stats||null;
+ const host=d.querySelector('#model-host'),controls=d.querySelector('#view-controls');host.replaceChildren();controls.replaceChildren();
+ d.querySelector('#model-stats').replaceChildren();d.querySelector('#view-label').textContent='';
  d.querySelector('#comment-form button').disabled=Boolean(!canReview()||state.selected.demo||!state.version);
- d.querySelector('#download-version').disabled=Boolean(state.selected.demo||!state.version);
+ const plan=planReviewMedia(state.version),download=d.querySelector('#download-version');
+ download.disabled=!plan.attachment;download.textContent=plan.attachment?'下载 FBX · '+size(plan.attachment.size):'暂无 FBX 附件';
+ download.title=plan.attachment?'点击后才下载 '+plan.attachment.name:'可在提交版本时附加 FBX，或选择历史版本下载';
  const reviewSelect=d.querySelector('#asset-status');if(reviewSelect)reviewSelect.disabled=true;
  const finishReading=async()=>{if(!d.isConnected||request!==loadSerial)return;await markTeacherRead(readingAsset,state.version);if(d.isConnected&&request===loadSerial&&reviewSelect)reviewSelect.disabled=Boolean(!state.version||state.version.id!==state.versions[0]?.id);};
- const progress=d.querySelector('.viewer-toolbar > .badge');if(progress){progress.className='badge '+state.selected.status;progress.textContent=STATUS[state.selected.status];}
- if(state.versions.length)d.querySelectorAll('#versions option').forEach(o=>{if(!state.versions.some(v=>v.id===o.value))o.remove();});
- if(!state.version){host.innerHTML='<div class="viewer-empty">'+ico('upload')+'<h3>提交第一版作品</h3><p>模型与动画使用 FBX，特效使用 MP4。贴图请与 FBX 一起选择。</p></div>';inspector(d);comments(d);return;}
- host.innerHTML='<div class="viewer-empty">正在读取文件…</div>';
- const files=await state.cloud.downloadVersion(state.version);
- if(!d.isConnected||request!==loadSerial)return;state.files=files;host.innerHTML='';
- if(state.selected.category==='vfx'){
-   if(state.selected.demo){host.innerHTML='<div class="viewer-empty">'+ico('vfx')+'<h3>MP4 特效检查区</h3><p>提交视频后，可播放、拖动进度并按时间点记录意见。</p></div>';}
-   else{const file=state.files.find(f=>/\.mp4$/i.test(f.name));if(!file)throw Error('此版本缺少 MP4 文件。');const video=document.createElement('video');video.controls=true;video.playsInline=true;video.preload='metadata';video.className='video-preview';video.src=URL.createObjectURL(file);host.append(video);state.video=video;video.onloadedmetadata=()=>{d.querySelector('#model-stats').innerHTML='<span>时长 <strong>'+video.duration.toFixed(1)+' 秒</strong></span><span>分辨率 <strong>'+video.videoWidth+' × '+video.videoHeight+'</strong></span><span>文件 <strong>'+size(file.size)+'</strong></span>';};video.onloadeddata=()=>{if(d.isConnected&&request===loadSerial)void finishReading();};video.onerror=()=>toast('视频无法解码，请导出为兼容浏览器的 H.264 / AAC MP4。');}
- }else{
-   try{state.viewer=new ReviewViewer(host,stats=>{if(d.isConnected&&request===loadSerial){state.stats=stats;renderStats(d);inspector(d);}});if(state.selected.demo)state.viewer.loadDemo(state.selected.category);else await state.viewer.loadFiles(state.files);
-   if(!d.isConnected||request!==loadSerial)return;
-   if(!readingAsset.demo)await finishReading();
-   controls.innerHTML='<div class="viewer-toolbar"><div class="viewer-tools"><button class="filter-chip active" data-view="material">中性材质</button><button class="filter-chip" data-view="albedo">贴图原色</button><button class="filter-chip" data-view="clay">白模</button><button class="filter-chip" data-view="fbx">FBX 原材质</button><button class="filter-chip" data-view="wireframe">线框</button><button class="filter-chip" data-view="normal">法向着色</button></div><div class="viewer-tools"><button class="button ghost small" id="normal-arrows">法向箭头</button><button class="button ghost small" id="skeleton">骨架</button><button class="button ghost small" id="reset-camera">重置视角</button></div></div><div class="preview-adjustments"><label>预览亮度 <input id="preview-exposure" aria-label="预览亮度" type="range" min="0.4" max="1.8" step="0.05" value="1"><output id="exposure-value">1.00×</output></label><label><input id="flip-normal-y" type="checkbox">法线贴图 Y 反向</label></div><p class="preview-note">中性白光 · 贴图原色不受灯光影响 · 白模检查真实几何。UE 三渲二与后期效果以引擎画面为准。</p>';
-   for(const key of['normal-arrows','skeleton'])controls.querySelector('#'+key).setAttribute('aria-pressed','false');
-   controls.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{state.viewer.setMode(b.dataset.view);for(const key of['normal-arrows','skeleton'])controls.querySelector('#'+key).setAttribute('aria-pressed','false');controls.querySelectorAll('[data-view]').forEach(x=>x.classList.toggle('active',x===b));});
-   controls.querySelector('#normal-arrows').onclick=run(e=>{const on=e.target.getAttribute('aria-pressed')!=='true';for(const key of['normal-arrows','skeleton'])controls.querySelector('#'+key).setAttribute('aria-pressed','false');state.viewer.showNormals(on);e.target.setAttribute('aria-pressed',String(on));});
-   controls.querySelector('#skeleton').onclick=e=>{const on=e.target.getAttribute('aria-pressed')!=='true';state.viewer.showSkeleton(on);e.target.setAttribute('aria-pressed',String(on));};
-   controls.querySelector('#reset-camera').onclick=()=>state.viewer.resetCamera();
-   controls.querySelector('#preview-exposure').oninput=event=>{state.viewer.setExposure(event.target.value);controls.querySelector('#exposure-value').textContent=state.viewer.exposure.toFixed(2)+'×';};
-   controls.querySelector('#flip-normal-y').disabled=!state.stats?.materials.some(m=>m.maps.some(t=>t.slot==='normalMap'&&!t.missing));
-   controls.querySelector('#flip-normal-y').onchange=event=>{state.viewer.flipNormalY(event.target.checked);for(const key of['normal-arrows','skeleton'])controls.querySelector('#'+key).setAttribute('aria-pressed','false');};
-   if(state.viewer.clips.length){const line=document.createElement('div');line.className='animation-controls';line.innerHTML='<button class="button small" id="play">暂停</button><select id="clips" aria-label="动画片段">'+state.viewer.clips.map((c,i)=>'<option value="'+i+'">'+esc(c.name||'动作 '+(i+1))+'</option>').join('')+'</select><input id="timeline" aria-label="动画时间" type="range" min="0" max="'+state.viewer.clips[0].duration+'" step="0.01" value="0"><select id="speed" aria-label="播放速度"><option value="0.5">0.5×</option><option selected value="1">1×</option><option value="2">2×</option></select>';controls.append(line);line.querySelector('#play').onclick=e=>{state.viewer.playing=!state.viewer.playing;e.target.textContent=state.viewer.playing?'暂停':'播放';};line.querySelector('#clips').onchange=e=>{state.viewer.selectClip(Number(e.target.value));line.querySelector('#timeline').max=state.viewer.clip.duration;line.querySelector('#play').textContent='暂停';};line.querySelector('#timeline').oninput=e=>{state.viewer.setTime(e.target.value);line.querySelector('#play').textContent='播放';};line.querySelector('#speed').onchange=e=>state.viewer.speed=Number(e.target.value);}
-   const timeline=controls.querySelector('#timeline');
-   if(timeline){const viewer=state.viewer;const ticker=setInterval(()=>{if(!timeline.isConnected||state.viewer!==viewer){clearInterval(ticker);return;}timeline.value=viewer.action?.time||0;},250);}
-   }catch(e){if(!d.isConnected||request!==loadSerial)return;host.innerHTML='<div class="viewer-empty"><h3>暂时无法预览此文件</h3><p>'+esc(e.message)+'</p><p>可使用“下载版本”在建模软件中检查，或重新导出 FBX。</p></div>';toast(e.message);}
- }
- comments(d);inspector(d);
+ const badge=d.querySelector('.viewer-toolbar > .badge');if(badge){badge.className='badge '+readingAsset.status;badge.textContent=STATUS[readingAsset.status];}
+ if(!state.version){host.innerHTML='<div class="viewer-empty"><h3>提交第一版作品</h3><p>模型提交 1–4 张 JPG / PNG，图片统一为 1920×1080；动画与特效提交 MP4。FBX 仅作为点击下载的附件。</p></div>';inspector(d);comments(d);return;}
+ state.media=new MediaReview({host,controls,version:state.version,cloud:state.cloud,onReady:()=>void finishReading(),onUpdate:()=>{if(d.isConnected&&request===loadSerial)renderStats(d);}});
+ await state.media.start();
+ if(!d.isConnected||request!==loadSerial)return;
+ renderStats(d);comments(d);inspector(d);
 }
-function renderStats(d){const s=state.stats;if(!s)return;d.querySelector('#model-stats').innerHTML=[['三角面',fmt(s.triangles)],['缓冲顶点',fmt(s.vertices)],['网格',s.meshes],['材质',s.materialCount],['骨骼',s.bones]].map(([k,v])=>'<span>'+k+' <strong>'+v+'</strong></span>').join('');}
-function inspector(d,tab){const panel=d.querySelector('#inspector');if(!panel)return;tab=tab||d.querySelector('[data-tab].active')?.dataset.tab||'summary';const s=state.stats;
- if(tab==='materials')panel.innerHTML=s?'<p class="help-text">FBX 原始材质与实际贴图如下。中性材质使用网页 PBR 近似；“FBX 原材质”可对照导入结果。Y 反向仅用于法线贴图凹凸方向不一致时。</p>'+s.materials.map(m=>'<div class="material-row"><span class="material-swatch" style="background:'+esc(m.color)+'"></span><div><strong>'+esc(m.name)+(m.pbrRestored?' · 已读取 PBR 贴图':'')+'</strong><small>'+esc(m.type)+' · '+(m.maps.map(x=>esc(x.slot+': '+x.name+(x.missing?'（缺失）':''))).join('；')||'无已加载贴图')+'</small></div></div>').join('')+(s.pbrRecovery?.warnings?.length?'<div class="notice">'+s.pbrRecovery.warnings.map(esc).join('；')+'</div>':''):'加载模型后显示实际材质。';
- else if(tab==='structure'){panel.innerHTML=s?s.nodes.map(n=>'<label class="structure-node" style="padding-left:'+Math.min(n.depth*14,100)+'px"><input type="checkbox" data-node="'+esc(n.id)+'" '+(n.visible?'checked':'')+'><span>'+esc(n.name)+'</span><small>'+esc(n.type)+'</small></label>').join(''):'加载模型后显示真实层级。';panel.querySelectorAll('[data-node]').forEach(n=>n.onchange=()=>state.viewer?.nodeVisible(n.dataset.node,n.checked));}
- else panel.innerHTML='<p class="help-text">'+esc(state.selected.description||'尚未填写检查说明。')+'</p>'+(s?'<p class="help-text">面数按导入后的三角面统计；缓冲顶点可能因 UV、法向等重复。中性材质支持已识别的粗糙度与金属度贴图，不能还原 UE 材质节点、描边和后期三渲二。'+(s.skinned?' 当前包含蒙皮网格：法向着色可随动画查看，箭头仅适用于静态网格。':'')+'</p>'+(s.pbrRecovery?.restoredMaterials?.length?'<p class="help-text">已恢复 PBR 贴图：'+s.pbrRecovery.restoredMaterials.map(m=>esc(m.name+'（'+m.slots.join('、')+'）')).join('；')+'。</p>':'')+(s.missingTextures?.length?'<div class="notice">未找到贴图：'+s.missingTextures.map(esc).join('、')+'。请重新提交 FBX 与对应贴图。</div>':'')+(s.pbrRecovery?.warnings?.length?'<div class="notice">'+s.pbrRecovery.warnings.map(esc).join('；')+'</div>':''):'')+'<p class="help-text">检查操作：左键旋转 · 右键平移 · 滚轮缩放。意见绑定当前版本，并记录视角或视频时间点。</p>';
+function renderStats(d){
+ const s=state.stats||{},plan=planReviewMedia(state.version),pairs=[];
+ if(plan.images.length)pairs.push(['图片',plan.images.length+' 张'],['图片尺寸','1920 × 1080']);
+ if(plan.video)pairs.push(['视频',size(plan.video.size)]);
+ if(Number.isFinite(s.triangles))pairs.push(['历史三角面记录',fmt(s.triangles)]);
+ if(plan.attachment)pairs.push(['FBX 附件',size(plan.attachment.size)]);
+ d.querySelector('#model-stats').innerHTML=pairs.map(([key,value])=>'<span>'+esc(key)+' <strong>'+esc(value)+'</strong></span>').join('');
+}
+function inspector(d,tab){
+ const panel=d.querySelector('#inspector');if(!panel)return;
+ tab=tab||d.querySelector('[data-tab].active')?.dataset.tab||'summary';
+ const plan=planReviewMedia(state.version);
+ if(tab==='files'){
+  const files=state.version?.files||[];
+  panel.innerHTML=files.length?'<div class="review-file-list">'+files.map(file=>'<div><span>'+esc(file.name)+'</span><small>'+size(file.size)+(/\.fbx$/i.test(file.name)?' · 点击上方按钮下载':'')+'</small></div>').join('')+'</div>':'<p class="help-text">此版本没有文件。</p>';
+  if(plan.attachment&&!files.some(file=>file.id===plan.attachment.id))panel.insertAdjacentHTML('beforeend','<p class="help-text">沿用 FBX 下载附件：'+esc(plan.attachment.name)+' · '+size(plan.attachment.size)+'</p>');
+ }else panel.innerHTML='<p class="help-text">'+esc(state.selected.description||'尚未填写检查说明。')+'</p><p class="help-text">图片可使用上一张、下一张、页码或左右滑动检查。意见会记录当前图片页码或视频时间点。</p><p class="help-text">FBX 只在点击“下载 FBX”后下载。网站不再加载三维模型；材质、结构与法向请通过提交图片展示，精确检查可下载原件。</p>';
 }
 function comments(d){const list=d.querySelector('#comments');if(!list)return;const rows=state.comments.filter(c=>c.version_id===state.version?.id);list.innerHTML='<h4>本版意见 <span>'+rows.length+'</span></h4>'+(!rows.length?'<div class="empty-state"><p>还没有意见，等待一次新的交流。</p></div>':rows.map(c=>'<article class="comment-card"><div class="comment-meta"><strong>'+esc(c.author_name)+((c.is_guest||c.guest_link_id)?' <small>· 访客</small>':'')+'</strong><time>'+date(c.created_at)+'</time></div><div class="asset-meta"><span>'+esc(DIM[c.dimension]||'整体建议')+'</span><span class="badge '+(c.verdict==='changes'?'changes':c.verdict==='approved'?'approved':'pending')+'">'+({note:'一般建议',changes:'建议修改',approved:'建议通过'}[c.verdict]||'意见')+'</span></div><p class="comment-text">'+esc(c.body)+'</p>'+(c.context&&Object.keys(c.context).length?'<button class="button ghost small" data-context="'+esc(c.id)+'">定位检查位置'+(Number.isFinite(c.context.time)?' · '+c.context.time.toFixed(1)+'s':'')+'</button>':'')+'</article>').join(''));
- list.querySelectorAll('[data-context]').forEach(b=>b.onclick=()=>{const c=rows.find(x=>x.id===b.dataset.context);if(state.video&&Number.isFinite(c.context.time)){state.video.currentTime=c.context.time;state.video.pause();}else state.viewer?.restore(c.context);});
+ list.querySelectorAll('[data-context]').forEach(b=>b.onclick=run(async()=>{const c=rows.find(x=>x.id===b.dataset.context);await state.media?.restore(c.context);}));
 }
 function upload(detail){
- requireStudent();
- let pendingVersion=null;
- const a=state.selected,d=dialog('提交新版本 · '+a.title,'<form class="form-grid"><label class="upload-zone">'+ico('upload')+'<strong>选择 '+(a.category==='vfx'?'MP4 视频':'FBX 与全部贴图')+'</strong><span>支持多选；每个版本保留原始文件</span><input name="files" type="file" multiple required accept="'+(a.category==='vfx'?'.mp4':'.fbx,.png,.jpg,.jpeg,.webp,.tga,.bmp,.gif')+'"></label><div class="file-list"></div><p class="help-text">单文件上限 200 MB，每次总计 300 MB。'+(state.mode==='cloud'?'云存储还受服务端配额与存储桶限制。':'当前提交仅保存在本机浏览器；请及时下载备份。')+'</p><div class="form-actions"><button class="button primary">保存并预览</button></div></form>');
- d.querySelector('input').onchange=e=>{pendingVersion=null;d.querySelector('.file-list').textContent=[...e.target.files].map(f=>f.name+' · '+size(f.size)).join('\n');};
- d.querySelector('form').onsubmit=run(async e=>{
-  e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;button.textContent='正在保存…';
+ requireStudent();let pendingVersion=null,prepared=null,busy=false;
+ const a=state.selected,retained=planReviewMedia(state.version).attachment;
+ const videoMode=['animation','vfx'].includes(a.category);
+ const d=dialog('提交新版本 · '+a.title,'<form class="form-grid media-upload-form"><label class="upload-zone">'+ico('upload')+'<strong>'+(videoMode?'选择 MP4 视频，可附最多 4 张 JPG / PNG':'选择 1–4 张 JPG / PNG 三视图或细节图')+'</strong><span>图片统一为 1920×1080，等比留边，不拉伸</span><input name="media" type="file" multiple required accept="'+(videoMode?'.mp4,.jpg,.jpeg,.png':'.jpg,.jpeg,.png')+'"></label><label class="field media-attachment-field">FBX 下载附件（可选，最多 1 个）<input name="attachment" type="file" accept=".fbx"><small>老师只有点击“下载 FBX”才会下载。模型修改后请附上新版 FBX。</small></label>'+(retained?'<label class="media-retain"><input name="retain" type="checkbox" checked> 沿用现有 FBX：'+esc(retained.name)+'（'+size(retained.size)+'）</label>':'')+'<div class="file-list"></div><p class="help-text">图片按选择顺序翻页。模型最多 4 张图片；动画和特效必须有 1 个 MP4。单文件上限 200 MB，每个版本总计 300 MB。</p><p class="media-upload-error" role="alert" aria-live="polite"></p><div class="form-actions"><button class="button primary">保存并预览</button></div></form>');
+ const form=d.querySelector('form'),error=d.querySelector('.media-upload-error');
+ const selection=()=>[...form.elements.media.files,...form.elements.attachment.files];
+ const changed=()=>{pendingVersion=null;prepared=null;error.textContent='';d.querySelector('.file-list').textContent=selection().map((file,index)=>(index+1)+'. '+file.name+' · '+size(file.size)).join('\n');if(form.elements.attachment.files.length&&form.elements.retain)form.elements.retain.checked=false;};
+ form.querySelectorAll('input').forEach(input=>input.addEventListener('change',changed));
+ form.onsubmit=async event=>{
+  event.preventDefault();if(busy)return;busy=true;const button=form.querySelector('button');button.disabled=true;error.textContent='';
+  form.querySelectorAll('input').forEach(input=>input.disabled=true);d.querySelector('.close-button').disabled=true;
   try{
-    requireStudent();const files=[...e.target.elements.files.files],v=validateFiles(a.category,files);
-    const cloudMode=state.mode==='cloud',source=previewSource();
-    let preview,previewError;
-    button.textContent='正在生成预览…';
-    try{preview=await generateMediaThumbnail(files,a.category);}catch(error){previewError=error.message;}
-    button.textContent='正在保存…';
-    pendingVersion ||= {id:uid(),asset_id:a.id,number:Math.max(0,...state.versions.map(x=>x.number))+1,filename:v.mainFile.name,stats:preview?{...preview.stats,thumbnail:preview.thumbnail,thumbnail_revision:2}:{},created_at:new Date().toISOString()};
-    let version=pendingVersion;
-    requireStudent();version=await state.cloud.uploadVersion(a.id,version,files,({sent,total})=>{button.textContent='正在上传 '+Math.round(sent/total*100)+'%…';});
-    // The version is committed. Later status/preview errors must not invite a duplicate upload.
-    if(state.selected?.id===a.id)state.versions.unshift(version);
-    let warning=previewError?'版本已保存，文件暂时无法生成预览；可打开作品查看详情。':'';
-    const changed={...a,status:'review',teacher_read_version_id:null,teacher_read_at:null,updated_at:new Date().toISOString()};
-    try{const saved=await state.cloud.saveAsset(changed);Object.assign(a,saved||changed);}
-    catch{warning='版本已保存，作品进度未能更新，请稍后重新设置进度。';}
-    assetPreviews.set(previewKey(a,source),preview?{versionId:version.id,thumbnail:preview.thumbnail}:{versionId:version.id,error:previewError});
-    if(preview)void writePreview(source.scope,version.id,preview.thumbnail);
-    d.close();render();
-    if(detail.isConnected&&state.selected?.id===a.id){
-      detail.querySelector('#versions').insertAdjacentHTML('afterbegin','<option value="'+esc(version.id)+'">V'+version.number+' · '+esc(version.filename)+'</option>');
-      detail.querySelector('#versions').value=version.id;
-      const statusSelect=detail.querySelector('#asset-status');if(statusSelect)statusSelect.value=a.status;
-      try{await loadVersion(detail,version.id);}catch{warning=warning||'版本已保存，预览暂时无法读取；请重新打开此作品。';}
-    }
-    toast(warning||'版本已提交到共享评审。');
-  }finally{if(d.isConnected){button.disabled=false;button.textContent='保存并预览';}}
- });
+   requireStudent();const chosen=selection();validateFiles(a.category,chosen);
+   const source=previewSource();
+   if(!prepared){button.textContent='正在处理图片与视频…';prepared=await prepareSubmissionMedia(a.category,chosen,{onProgress:({completed,total})=>{button.textContent='正在处理预览 '+completed+' / '+total+'…';}});}
+   const stats={...prepared.stats,thumbnail:prepared.thumbnail,thumbnail_revision:3};
+   if(retained&&form.elements.retain?.checked&&!chosen.some(file=>/\.fbx$/i.test(file.name)))stats.downloadAttachment={...retained,sourceVersionId:retained.sourceVersionId||state.version?.id};
+   pendingVersion||={id:uid(),asset_id:a.id,number:Math.max(0,...state.versions.map(version=>version.number))+1,filename:prepared.mainFile.name,stats,created_at:new Date().toISOString()};
+   button.textContent='正在上传…';requireStudent();
+   const version=await state.cloud.uploadVersion(a.id,pendingVersion,prepared.files,({sent,total})=>{button.textContent='正在上传 '+Math.round(sent/total*100)+'%…';});
+   if(state.selected?.id===a.id&&!state.versions.some(row=>row.id===version.id))state.versions.unshift(version);
+   const changedAsset={...a,status:'review',teacher_read_version_id:null,teacher_read_at:null,updated_at:new Date().toISOString()};let warning='';
+   try{const saved=await state.cloud.saveAsset(changedAsset);Object.assign(a,saved||changedAsset);}catch{warning='版本已保存，请刷新作品确认进度。';}
+   assetPreviews.set(previewKey(a,source),{versionId:version.id,thumbnail:prepared.thumbnail});
+   if(prepared.thumbnail)void writePreview(source.scope,version.id,prepared.thumbnail);
+   d.close();render();
+   if(detail.isConnected&&state.selected?.id===a.id){
+    const select=detail.querySelector('#versions');select.innerHTML=state.versions.map(row=>'<option value="'+esc(row.id)+'">V'+row.number+' · '+esc(row.filename)+'</option>').join('');select.value=version.id;
+    await loadVersion(detail,version.id);
+   }
+   toast(warning||'图片 / 视频版本已提交到共享评审。');
+  }catch(cause){if(d.isConnected)error.textContent=cause.message||'提交未完成，请稍后重试。';else toast(cause.message||'版本已保存，请重新打开作品。');}
+  finally{busy=false;if(d.isConnected){button.disabled=false;button.textContent='保存并预览';form.querySelectorAll('input').forEach(input=>input.disabled=false);d.querySelector('.close-button').disabled=false;}}
+ };
+ d.addEventListener('cancel',event=>{if(busy)event.preventDefault();});
 }
 function editAsset(a,detail){
  requireStudent();
@@ -464,7 +452,19 @@ async function exportReviewRecords(asset){
  panel.querySelector('#download-feedback-json').onclick=()=>downloadFeedbackFile(stem+'.json',JSON.stringify(record,null,2),'application/json;charset=utf-8');
 }
 
-async function downloadVersion(){if(!state.files.length)throw Error('当前没有可下载的原始文件。');const data={};for(const f of state.files)data[f.relativePath||f.name]=new Uint8Array(await f.arrayBuffer());const blob=new Blob([zipSync(data,{level:0})],{type:'application/zip'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=state.selected.title+'_V'+state.version.number+'.zip';a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}
+async function downloadVersion(button){
+ const version=state.version,attachment=planReviewMedia(version).attachment;
+ if(!attachment)throw Error('此版本没有 FBX 下载附件，请选择历史版本或补交附件。');
+ if(state.downloadController)return;
+ const controller=new AbortController();state.downloadController=controller;const label=button.textContent;button.disabled=true;
+ try{
+  const file=await state.cloud.downloadFile(attachment,{signal:controller.signal,onProgress:({received,total})=>{if(button.isConnected&&state.downloadController===controller&&state.version?.id===version.id)button.textContent=total?'下载中 '+Math.round(received/total*100)+'%':'下载中 '+size(received);}});
+  if(controller.signal.aborted)return;
+  const url=URL.createObjectURL(file),link=document.createElement('a');link.href=url;link.download=attachment.name;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+  toast('FBX 已交给浏览器下载，请查看浏览器的下载列表。');
+ }catch(error){if(error.name!=='AbortError')throw error;}
+ finally{if(state.downloadController===controller){state.downloadController=null;if(button.isConnected&&state.version?.id===version.id){button.disabled=false;button.textContent=label;}}}
+}
 async function share(){
  requireStudent();
  const url=new URL(location.href);url.hash='';url.search='';
@@ -473,7 +473,7 @@ async function share(){
  d.querySelector('#copy-link').onclick=async()=>{try{await navigator.clipboard.writeText(url.href);toast('网址已复制，可以发给老师。');}catch{const field=d.querySelector('#review-url');field.focus();field.select();toast('网址已选中，请长按复制。');}};
 }
 function settings(){dialog('共享评审','<p>作品、原始文件、历史版本与老师反馈统一保存在共享评审中。手机 QQ、微信和电脑打开同一个网址，登录后即可查看。</p>');}
-function help(){dialog('提交与检查说明','<div class="help-content"><h3>1 · 添加作品与提交版本</h3><p>五类作品的数量不限。场景、角色、产品及动画提交一个 FBX，并同时选择外部贴图；游戏特效提交 MP4。新版本保留旧文件，意见按版本分别保存。</p><h3>2 · 检查模型</h3><p>旋转、平移、缩放模型，切换材质、线框与法向着色。结构面板可开关实际节点；材质面板列出实际加载的贴图。动画支持片段切换与时间拖动。FBX 无法完整携带 UE 的三渲二材质与后期效果，以引擎画面为准。</p><h3>3 · 手机与电脑共享</h3><p>学生与老师使用同一个网址，以各自的访问密码登录。作品、版本、已读信息、检查状态和留言保存在共享评审中。返回页面时会刷新，也可点击“刷新作品”或作品里的“刷新反馈”。网络中断时会提示失败，不会把提交改存到这台设备。</p><h3>4 · 迁移旧作品</h3><p>以前保存在手机 QQ 等浏览器里的旧作品，需要在原来的设备与浏览器登录学生端，点击“迁移这台设备上的旧作品”。作品与版本迁移完成后，其他设备即可查看。若还需迁移原有老师意见与检查结果，可在迁移窗口输入教师访问密码确认；原记录始终保留。</p><h3>5 · 文件备份</h3><p>可下载版本与导出评审记录另行备份。单文件上限 200 MB，每个版本总计 300 MB。MP4 推荐 H.264 / AAC 编码；贴图请与 FBX 一起选择。</p></div>');}
+function help(){dialog('提交与检查说明','<div class="help-content"><h3>1 · 提交图片与视频</h3><p>场景、角色和产品模型提交 1–4 张 JPG / PNG，可使用正面、侧面、背面和细节图。图片等比留边统一为 1920×1080。游戏动画和游戏特效提交 1 个 MP4，也可附最多 4 张图片。</p><h3>2 · 翻页检查</h3><p>图片使用上一张、下一张、页码或左右滑动查看。MP4 点击“加载并播放”后播放；留言记录图片页码或视频时间点。</p><h3>3 · FBX 主动下载</h3><p>FBX 作为可选原件附件，打开目录或作品都不会下载它。老师点击“下载 FBX”时才开始下载，之后可在建模软件或 UE 中检查。提交新版本时可沿用现有 FBX，也可选择新版附件。</p><h3>4 · 手机与电脑共享</h3><p>原网址、登录身份与共享评审保持一致，作品、版本、老师已读、检查状态和留言在手机和电脑间共享。旧版本和反馈继续保留。</p><h3>5 · 已有作品与文件限制</h3><p>旧 FBX 版本保留下载；若没有三视图，可提交新的图片版本。每个文件上限 200 MB，每个版本总计 300 MB。MP4 建议使用 H.264 / AAC 编码。</p></div>');}
 async function boot(){
  try{
   const response=await fetch(new URL('config.json',document.baseURI),{cache:'no-store'});

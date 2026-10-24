@@ -3,6 +3,8 @@ const SESSION_KEY = 'qixi-shared-session-v1:';
 const PART_BYTES = 5 * 1024 * 1024;
 const MAX_FILE_BYTES = 200 * 1024 * 1024;
 const MAX_VERSION_BYTES = 300 * 1024 * 1024;
+const DOWNLOAD_IDLE_MS = 60_000;
+const DOWNLOAD_TOTAL_MS = 300_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const uuid = value => { if (!UUID.test(value || '')) throw Error('作品或版本编号无效。'); return encodeURIComponent(value); };
 const unwrap = (data, key) => data?.[key] ?? data;
@@ -63,7 +65,7 @@ export function createSharedApi(config, options = {}) {
     storage.setItem(key, JSON.stringify(grant));
     session = grant;
   }
-  async function request(path, { method = 'GET', json, body, token, anonymous = false, raw = false } = {}) {
+  async function request(path, { method = 'GET', json, body, token, anonymous = false, raw = false, signal } = {}) {
     const activeToken = token || session?.token;
     if (!anonymous && !activeToken) throw Object.assign(Error('请重新输入访问密码登录。'), { status: 401 });
     const headers = new Headers();
@@ -71,8 +73,11 @@ export function createSharedApi(config, options = {}) {
     if (json !== undefined) headers.set('Content-Type', 'application/json');
     if (body !== undefined) headers.set('Content-Type', 'application/octet-stream');
     let response;
-    try { response = await fetcher(base + path, { method, headers, body: json !== undefined ? JSON.stringify(json) : body, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' }); }
-    catch (cause) { throw Object.assign(Error('无法连接共享服务，请检查网络后重试；作品不会改存到本机。', { cause }), { network: true }); }
+    try { response = await fetcher(base + path, { method, headers, body: json !== undefined ? JSON.stringify(json) : body, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', ...(signal ? { signal } : {}) }); }
+    catch (cause) {
+      if (signal?.aborted) throw Object.assign(Error('请求已取消。'), { name: 'AbortError' });
+      throw Object.assign(Error('无法连接共享服务，请检查网络后重试；作品不会改存到本机。', { cause }), { network: true });
+    }
     if (!response.ok) {
       let detail; try { detail = await response.json(); } catch { /* HTML errors must not be shown as saved data. */ }
       if (response.status === 401 && !anonymous && activeToken === session?.token) { clear(); options.onUnauthorized?.(); }
@@ -193,15 +198,86 @@ export function createSharedApi(config, options = {}) {
       throw error;
     }
   }
-  async function downloadVersion(version) {
+  async function downloadFile(metadata, { onProgress, signal } = {}) {
+    if (!metadata || typeof metadata.id !== 'string' || !metadata.id) throw Error('下载文件编号无效。');
+    const relativePath = relativeFileName({ name: metadata.name, relativePath: metadata.relative_path });
+    const expectedSize = Number.isSafeInteger(metadata.size) && metadata.size > 0 ? metadata.size : 0;
+    if (expectedSize > MAX_FILE_BYTES) throw Error('文件超过单文件 200 MB 的下载上限。');
+    const aborted = () => Object.assign(Error('已取消文件下载。'), { name: 'AbortError' });
+    if (signal?.aborted) throw aborted();
+    const controller = new AbortController();
+    let reader, idleTimer, totalTimer, rejectLimit, finished = false, completed = false;
+    const limit = new Promise((_, reject) => { rejectLimit = reject; });
+    const cancelReader = () => { try { if (reader) Promise.resolve(reader.cancel()).catch(() => {}); } catch { /* The request deadline must still reject. */ } };
+    const stop = error => {
+      if (finished) return;
+      controller.abort();
+      // Cancellation is best effort: a stalled stream must not keep the dialog waiting.
+      cancelReader();
+      rejectLimit(error);
+    };
+    const timeout = () => stop(Object.assign(Error('文件下载超时，请检查网络后重试。'), { timeout: true, network: true }));
+    const resetIdle = () => { unschedule(idleTimer); idleTimer = schedule(timeout, DOWNLOAD_IDLE_MS); };
+    const abort = () => stop(aborted());
+    signal?.addEventListener('abort', abort, { once: true });
+    resetIdle(); totalTimer = schedule(timeout, DOWNLOAD_TOTAL_MS);
+    try {
+      const operation = (async () => {
+        // Files remain authenticated. Never put a login token into a preview or download URL.
+        const response = await request('/files/' + encodeURIComponent(metadata.id), { raw: true, signal: controller.signal });
+        if (controller.signal.aborted) throw aborted();
+        resetIdle();
+        const contentLength = Number(response.headers?.get('content-length'));
+        const total = expectedSize || (Number.isSafeInteger(contentLength) && contentLength > 0 ? contentLength : 0);
+        let received = 0;
+        const progress = () => onProgress?.({ received, total, filename: metadata.name });
+        progress();
+        const chunks = [];
+        reader = response.body?.getReader?.();
+        if (reader) {
+          while (true) {
+            if (controller.signal.aborted) throw aborted();
+            const { value, done } = await reader.read();
+            if (controller.signal.aborted) throw aborted();
+            if (done) break;
+            received += value.byteLength;
+            if (received > MAX_FILE_BYTES) throw Error('文件超过单文件 200 MB 的下载上限。');
+            chunks.push(value); resetIdle(); progress();
+          }
+        } else {
+          const blob = await response.blob();
+          if (controller.signal.aborted) throw aborted();
+          received = blob.size;
+          if (received > MAX_FILE_BYTES) throw Error('文件超过单文件 200 MB 的下载上限。');
+          chunks.push(blob); progress();
+        }
+        if (expectedSize && received !== expectedSize) throw Object.assign(Error('文件下载不完整，请重新下载。'), { network: true });
+        if (controller.signal.aborted) throw aborted();
+        const file = new File(chunks, metadata.name, { type: metadata.type || response.headers?.get('content-type') || 'application/octet-stream' });
+        Object.defineProperty(file, 'relativePath', { value: relativePath });
+        completed = true;
+        return file;
+      })();
+      return await Promise.race([operation, limit]);
+    } catch (cause) {
+      if (signal?.aborted) throw aborted();
+      if (cause.status || cause.timeout || cause.network || /200 MB/.test(cause.message)) throw cause;
+      throw Object.assign(Error('文件下载中断，请检查网络后重试。', { cause }), { network: true });
+    } finally {
+      finished = true; unschedule(idleTimer); unschedule(totalTimer);
+      signal?.removeEventListener('abort', abort);
+      if (!completed) {
+        controller.abort();
+        cancelReader();
+      }
+    }
+  }
+  async function downloadVersion(version, options = {}) {
     if (!version.files?.length) return [];
     // Sequential reads bound memory and simultaneous QQ webview requests.
     const files = [];
     for (const metadata of version.files) {
-      const response = await request('/files/' + encodeURIComponent(metadata.id), { raw: true });
-      const file = new File([await response.blob()], metadata.name, { type: metadata.type || 'application/octet-stream' });
-      Object.defineProperty(file, 'relativePath', { value: relativeFileName({ name: metadata.name, relativePath: metadata.relative_path }) });
-      files.push(file);
+      files.push(await downloadFile(metadata, options));
     }
     return files;
   }
@@ -210,7 +286,7 @@ export function createSharedApi(config, options = {}) {
     listAssets, listDeletedAssets: async () => (await request('/assets?deleted=1')).assets,
     createAsset: async ({ id, title, category, description }) => unwrap(await request('/assets', { method: 'POST', json: { id, title, category, description } }), 'asset'),
     saveAsset: async ({ id, title, description }) => unwrap(await request('/assets/' + uuid(id), { method: 'PATCH', json: { title, description } }), 'asset'),
-    listVersions, uploadVersion, downloadVersion,
+    listVersions, uploadVersion, downloadFile, downloadVersion,
     listComments: async id => (await request('/assets/' + uuid(id) + '/comments')).comments,
     addComment: async comment => unwrap(await request('/comments', { method: 'POST', json: comment }), 'comment'),
     reviewAsset: async (id, status, versionId) => unwrap(await request('/assets/' + uuid(id) + '/review', { method: 'POST', json: { status, versionId } }), 'asset'),

@@ -4,40 +4,55 @@ import { FILE_LIMITS, relativeFilePath, validateAsset, validateComment, validate
 
 const file = (name, size = 100, path = name, type = '') => ({ name, size, relativePath: path, type });
 
-test('each model category accepts one case-insensitive FBX plus common external textures', () => {
-  for (const category of ['scene', 'character', 'product', 'animation']) {
-    const main = file('Model.FBX');
-    const texture = file('Diffuse.PNG', 200, 'textures/Diffuse.PNG', 'image/png');
-    assert.deepEqual(validateFiles(category, [main, texture]), { mainFile: main, textureFiles: [texture], totalBytes: 300 });
+test('model categories require review images and accept one optional download-only FBX', () => {
+  for (const category of ['scene', 'character', 'product']) {
+    const source = file('Model.FBX');
+    const image = file('Front.PNG', 200, 'images/Front.PNG', 'image/png');
+    assert.deepEqual(validateFiles(category, [source, image]), {
+      mainFile: image, textureFiles: [], imageFiles: [image], videoFile: null,
+      fbxFile: source, totalBytes: 300, previewKind: 'images',
+    });
+    assert.equal(validateFiles(category, [image]).fbxFile, null);
+    assert.throws(() => validateFiles(category, [source]), /检查图片/);
+    assert.throws(() => validateFiles(category, [image, file('demo.mp4')]), /不支持/);
   }
 });
 
-test('vfx accepts only a single MP4 and rejects textures and FBX', () => {
-  const main = file('effect.mp4');
-  assert.equal(validateFiles('vfx', [main]).mainFile, main);
-  assert.throws(() => validateFiles('vfx', [main, file('preview.png')]), /不支持/);
-  assert.throws(() => validateFiles('vfx', [file('model.fbx')]), /不支持/);
-  assert.throws(() => validateFiles('vfx', [main, file('effect2.mp4')]), /仅包含一个 MP4/);
+test('animations and vfx require one MP4 with optional review images and FBX', () => {
+  for (const category of ['animation', 'vfx']) {
+    const main = file('effect.MP4'), image = file('preview.png'), source = file('source.fbx');
+    const result = validateFiles(category, [image, source, main]);
+    assert.equal(result.mainFile, main);
+    assert.equal(result.previewKind, 'video');
+    assert.deepEqual(result.imageFiles, [image]);
+    assert.equal(result.videoFile, main);
+    assert.equal(result.fbxFile, source);
+    assert.throws(() => validateFiles(category, [source, image]), /仅包含一个 MP4/);
+    assert.throws(() => validateFiles(category, [main, file('effect2.mp4')]), /仅包含一个 MP4/);
+  }
 });
 
-test('missing main file, multiple models, empty files, invalid categories are rejected', () => {
-  assert.throws(() => validateFiles('scene', []), /FBX/);
-  assert.throws(() => validateFiles('scene', [file('map.png')]), /仅包含一个 FBX/);
-  assert.throws(() => validateFiles('scene', [file('a.fbx'), file('b.fbx')]), /分别提交/);
+test('image count, optional original count, empty files and categories are validated', () => {
+  assert.throws(() => validateFiles('scene', []), /检查图片/);
+  const images = ['a.jpg', 'b.jpeg', 'c.PNG', 'd.png'].map(name => file(name));
+  assert.equal(validateFiles('scene', images).imageFiles.length, 4);
+  assert.throws(() => validateFiles('scene', [...images, file('e.jpg')]), /最多提交 4 张/);
+  assert.throws(() => validateFiles('animation', [...images, file('e.jpg'), file('walk.mp4')]), /最多提交 4 张/);
+  assert.throws(() => validateFiles('scene', [images[0], file('a.fbx'), file('b.fbx')]), /分别提交/);
   assert.throws(() => validateFiles('scene', [file('a.fbx', 0)]), /为空/);
   assert.throws(() => validateFiles('other', [file('a.fbx')]), /分类/);
 });
 
 test('script extensions and script MIME disguised as textures are rejected', () => {
-  const main = file('model.fbx');
-  for (const filename of ['evil.js', 'evil.html', 'evil.svg', 'evil.php', 'image.png.exe']) {
+  const main = file('front.jpg');
+  for (const filename of ['evil.js', 'evil.html', 'evil.svg', 'evil.php', 'image.png.exe', 'map.webp', 'map.tga', 'map.gif', 'map.bmp']) {
     assert.throws(() => validateFiles('scene', [main, file(filename)]), /不支持/);
   }
   assert.throws(() => validateFiles('scene', [main, file('map.png', 100, 'map.png', 'text/javascript')]), /脚本/);
 });
 
-test('duplicate paths and case-insensitive duplicate filenames are rejected before texture mapping', () => {
-  const main = file('model.fbx');
+test('duplicate paths and case-insensitive duplicate filenames are rejected', () => {
+  const main = file('front.jpg');
   assert.throws(() => validateFiles('scene', [main, file('map.png'), file('map.png')]), /重复文件路径/);
   assert.throws(() => validateFiles('scene', [main, file('Map.png', 100, 'A/Map.png'), file('map.PNG', 100, 'B/map.PNG')]), /同名文件/);
 });
@@ -50,11 +65,12 @@ test('relative file paths preserve folders but reject absolute and traversal pat
   assert.throws(() => validateFiles('scene', [file('a.fbx', 100, 'folder/b.fbx')]), /文件名与路径不一致/);
 });
 
-test('individual and aggregate byte limits enforce actual bytes including textures', () => {
-  assert.equal(validateFiles('scene', [file('a.fbx', FILE_LIMITS.maxFileBytes)]).totalBytes, FILE_LIMITS.maxFileBytes);
+test('individual and aggregate byte limits include preview media and optional FBX', () => {
+  assert.equal(validateFiles('scene', [file('a.jpg', FILE_LIMITS.maxFileBytes)]).totalBytes, FILE_LIMITS.maxFileBytes);
   assert.throws(() => validateFiles('scene', [file('a.fbx', FILE_LIMITS.maxFileBytes + 1)]), /单文件/);
   assert.throws(() => validateFiles('scene', [file('a.fbx', 160 * 1024 ** 2), file('map.png', 141 * 1024 ** 2)]), /总大小/);
   assert.throws(() => validateFiles('scene', [file('a.fbx', 11)], { maxFileBytes: 10, maxTotalBytes: 20 }), /单文件/);
+  for (const size of [-1, 1.5, NaN, Infinity]) assert.throws(() => validateFiles('scene', [file('a.jpg', size)]), /大小无效/);
 });
 
 test('asset and feedback text fields are trimmed and validated without deleting text markup', () => {

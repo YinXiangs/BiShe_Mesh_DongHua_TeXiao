@@ -1,0 +1,58 @@
+/* Images and videos replace the interactive FBX viewer. */
+.viewer-column .viewer-shell { flex: 0 0 auto; min-height: 0; height: auto; }
+#model-host.media-review-host {
+  width: 100%; height: auto !important; min-height: 0 !important;
+  aspect-ratio: 16 / 9; flex: 0 0 auto; background: #101c17;
+  position: relative; overflow: hidden; touch-action: pan-y;
+}
+.media-review-host:focus-visible { outline: 2px solid #a7c9b5; outline-offset: -3px; }
+.review-image, .media-review-host > .review-video {
+  position: absolute; inset: 0; display: block; width: 100%; height: 100%;
+  max-height: none; object-fit: contain; background: #101c17;
+}
+#model-host.media-review-host > .viewer-empty {
+  min-height: 0; height: 100%; position: absolute; inset: 0;
+  overflow: auto; padding: 22px; gap: 10px;
+}
+.media-message h3 { font-size: 16px; margin: 0; }
+.media-message p { margin: 0; }
+.media-message > .button { flex-shrink: 0; margin-top: 6px; }
+.media-video-poster { max-width: 200px; max-height: 100px; width: auto; height: auto; object-fit: contain; border-radius: 5px; }
+.media-legacy-note {
+  position: absolute; left: 12px; bottom: 12px; padding: 5px 9px; border-radius: 5px;
+  color: #dfede4; background: #102119cf; font-size: 11px;
+}
+.media-pagination {
+  display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
+  gap: 12px; padding: 14px 16px; background: #1b2822; border-bottom: 1px solid #30473b;
+}
+.media-pagination > .button { min-height: 38px; }
+.media-page-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.media-page-button {
+  display: grid; place-items: center; min-width: 36px; min-height: 36px; padding: 5px 9px;
+  border: 1px solid #476453; background: #21372b; color: #c8ddce; border-radius: 7px; cursor: pointer;
+}
+.media-page-button.active { background: #40775b; border-color: #7ba98a; color: #fff; }
+.media-page-button:focus-visible { outline: 2px solid #d5e9db; outline-offset: 2px; }
+.media-page-count { color: #c3d8c9; font-variant-numeric: tabular-nums; font-size: 12px; }
+.review-file-list { display: flex; flex-direction: column; gap: 8px; }
+.review-file-list > div { display: flex; justify-content: space-between; gap: 16px; overflow-wrap: anywhere; padding: 5px 0; }
+.review-file-list small { flex-shrink: 0; color: #a8c1b0; }
+.media-attachment-field, .media-retain, .media-upload-error { grid-column: 1 / -1; }
+.media-attachment-field small { font-size: 11px; line-height: 1.7; color: #a9c5b2; }
+.media-retain { display: flex; gap: 9px; align-items: flex-start; font-size: 12px; line-height: 1.8; }
+.media-retain input { margin-top: 5px; flex-shrink: 0; }
+.media-upload-error { color: #ffc1b8; font-size: 12px; white-space: pre-wrap; }
+.media-upload-error:empty { display: none; }
+.button:disabled, .media-page-button:disabled { opacity: .48; cursor: not-allowed; }
+@media (max-width: 600px) {
+  .media-pagination { gap: 8px; padding: 11px 8px; }
+  .media-pagination > .button { padding: 7px 9px; font-size: 11px; }
+  .media-page-buttons { gap: 4px; }
+  .media-page-button { min-width: 30px; min-height: 32px; font-size: 11px; padding: 4px 7px; }
+  #model-host.media-review-host > .viewer-empty { padding: 12px; gap: 5px; }
+  .media-message h3 { font-size: 13px; }
+  .media-message p { font-size: 11px; line-height: 1.6; }
+  .media-video-poster { max-height: 70px; max-width: 125px; }
+  .review-file-list > div { flex-direction: column; gap: 2px; }
+}

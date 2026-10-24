@@ -1,7 +1,7 @@
 export const CATEGORIES = Object.freeze(['scene', 'character', 'product', 'animation', 'vfx']);
 export const ASSET_STATUSES = Object.freeze(['pending', 'review', 'changes', 'approved']);
 export const FILE_LIMITS = Object.freeze({ maxFileBytes: 200 * 1024 ** 2, maxTotalBytes: 300 * 1024 ** 2 });
-const TEXTURE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'tga', 'bmp', 'gif']);
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg']);
 const SCRIPT_MIME = /(?:javascript|ecmascript|html|svg\+xml|x-sh|x-bat|x-msdownload|x-httpd-php)/i;
 
 export function validateText(value, { label = '内容', min = 1, max = 4000 } = {}) {
@@ -27,13 +27,14 @@ export function relativeFilePath(file) {
 export function validateFiles(category, inputFiles, limits = FILE_LIMITS) {
   if (!CATEGORIES.includes(category)) throw new Error('请选择有效的项目分类。');
   const files = Array.from(inputFiles || []);
-  if (!files.length) throw new Error(category === 'vfx' ? '请选择一个 MP4 视频。' : '请选择一个 FBX 模型及其贴图。');
+  const videoRequired = category === 'animation' || category === 'vfx';
+  if (!files.length) throw new Error(videoRequired ? '请选择一个 MP4 预览视频，可附图片和 FBX 原件。' : '请选择 1–4 张 JPG / PNG 模型检查图片，可附 FBX 原件。');
   const maxFileBytes = limits.maxFileBytes ?? FILE_LIMITS.maxFileBytes;
   const maxTotalBytes = limits.maxTotalBytes ?? FILE_LIMITS.maxTotalBytes;
   if (!(maxFileBytes > 0) || !(maxTotalBytes > 0)) throw new Error('文件大小限制配置无效。');
-  const expected = category === 'vfx' ? 'mp4' : 'fbx';
-  const mains = [];
-  const textureFiles = [];
+  const imageFiles = [];
+  const videoFiles = [];
+  const fbxFiles = [];
   const paths = new Set();
   const basenames = new Map();
   let totalBytes = 0;
@@ -45,7 +46,7 @@ export function validateFiles(category, inputFiles, limits = FILE_LIMITS) {
     const basename = path.split('/').at(-1).toLocaleLowerCase('en-US');
     if (basename !== file.name.normalize('NFC').toLocaleLowerCase('en-US')) throw new Error(`文件名与路径不一致：${file.name}`);
     if (paths.has(key)) throw new Error(`重复文件路径：${path}。请移除重复文件后重试。`);
-    if (basenames.has(basename)) throw new Error(`发现同名文件：${file.name}（${basenames.get(basename)} / ${path}）。请重命名并重新导出 FBX，避免贴图错配。`);
+    if (basenames.has(basename)) throw new Error(`发现同名文件：${file.name}（${basenames.get(basename)} / ${path}）。请重命名后重新选择。`);
     paths.add(key);
     basenames.set(basename, path);
     if (!Number.isSafeInteger(file.size) || file.size <= 0) throw new Error(`文件为空或大小无效：${file.name}`);
@@ -54,12 +55,17 @@ export function validateFiles(category, inputFiles, limits = FILE_LIMITS) {
     if (!Number.isSafeInteger(totalBytes) || totalBytes > maxTotalBytes) throw new Error(`本次提交超过 ${Math.round(maxTotalBytes / 1024 ** 2)} MiB 总大小限制。`);
     const extension = basename.includes('.') ? basename.split('.').at(-1) : '';
     if (SCRIPT_MIME.test(file.type || '')) throw new Error(`不允许上传脚本或网页文件：${file.name}`);
-    if (extension === expected) mains.push(file);
-    else if (category !== 'vfx' && TEXTURE_EXTENSIONS.has(extension)) textureFiles.push(file);
-    else throw new Error(`不支持的文件：${file.name}。${category === 'vfx' ? '特效仅接受 MP4。' : '模型和动画仅接受 FBX 及 PNG/JPG/WEBP/TGA/BMP/GIF 贴图。'}`);
+    if (IMAGE_EXTENSIONS.has(extension)) imageFiles.push(file);
+    else if (extension === 'mp4' && videoRequired) videoFiles.push(file);
+    else if (extension === 'fbx') fbxFiles.push(file);
+    else throw new Error(`不支持的文件：${file.name}。${videoRequired ? '请提交 MP4、JPG / PNG 和可选 FBX 原件。' : '模型检查仅接受 JPG / PNG 和可选 FBX 原件。'}`);
   }
-  if (mains.length !== 1) throw new Error(`每个版本必须包含且仅包含一个 ${expected.toUpperCase()} 文件，请分别提交多个作品。`);
-  return { mainFile: mains[0], textureFiles, totalBytes };
+  if (imageFiles.length > 4) throw new Error('每个作品版本最多提交 4 张 JPG / PNG 检查图片。');
+  if (fbxFiles.length > 1) throw new Error('每个版本最多附加一个 FBX 原件，请分别提交多个作品。');
+  if (videoRequired && videoFiles.length !== 1) throw new Error('动画和特效每个版本必须包含且仅包含一个 MP4 预览视频。');
+  if (!videoRequired && !imageFiles.length) throw new Error('请提交 1–4 张 JPG / PNG 模型检查图片，FBX 原件仅供点击下载。');
+  const mainFile = videoRequired ? videoFiles[0] : imageFiles[0];
+  return { mainFile, textureFiles: [], imageFiles, videoFile: videoFiles[0] || null, fbxFile: fbxFiles[0] || null, totalBytes, previewKind: videoRequired ? 'video' : 'images' };
 }
 
 export function validateAsset(asset) {

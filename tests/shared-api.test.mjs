@@ -10,10 +10,10 @@ const config={apiUrl:'https://shared.example.test'};
 const grant=(role='student')=>({token:'synthetic-token-for-'+role+'-abcdefghijklmnop',role,expiresAt:new Date(NOW+28_800_000).toISOString()});
 const json=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{'content-type':'application/json'}});
 function memoryStorage(){const map=new Map();return {map,getItem:key=>map.get(key)||null,setItem:(key,value)=>map.set(key,value),removeItem:key=>map.delete(key)};}
-function harness(handler){
+function harness(handler,options={}){
  const storage=memoryStorage(),calls=[];
  const fetch=async(url,options)=>{const call={path:new URL(url).pathname+new URL(url).search,...options};calls.push(call);return handler(call,calls);};
- const api=createSharedApi(config,{storage,fetch,now:()=>NOW});return {api,storage,calls};
+ const api=createSharedApi(config,{storage,fetch,now:()=>NOW,...options});return {api,storage,calls};
 }
 function readinessHarness(handler){
  let clock=NOW,nextTimer=0;const timers=new Map(),calls=[],delays=[];
@@ -215,6 +215,70 @@ test('download restores the actual byte contents and relative texture location',
  const bytes=new Uint8Array([31,9,24,0,222]);const {api,calls}=harness(call=>call.path==='/api/login'?json(grant()):new Response(bytes));
  await api.loginWithCode('synthetic');const [file]=await api.downloadVersion({files:[{id:'file-1',name:'albedo.png',relative_path:'Textures/albedo.png',type:'image/png'}]});
  assert.equal(file.name,'albedo.png');assert.equal(file.relativePath,'Textures/albedo.png');assert.deepEqual(new Uint8Array(await file.arrayBuffer()),bytes);assert.equal(calls.at(-1).headers.get('Authorization'),'Bearer '+grant().token);
+});
+
+test('single-file preview downloads only its requested image, preserving bytes, MIME, path and chunk progress',async()=>{
+ const bytes=new Uint8Array([1,3,5,7,9]);const progress=[];
+ const {api,calls}=harness(call=>call.path==='/api/login'?json(grant()):new Response(new ReadableStream({start(controller){controller.enqueue(bytes.subarray(0,2));controller.enqueue(bytes.subarray(2));controller.close();}}),{headers:{'content-length':'5'}}));
+ await api.loginWithCode('synthetic');
+ const image=await api.downloadFile({id:'image-1',name:'正视图.png',relative_path:'三视图/正视图.png',type:'image/png',size:5},{onProgress:item=>progress.push(item)});
+ assert.deepEqual(calls.map(call=>call.path),['/api/login','/api/files/image-1']);
+ assert.equal(image.name,'正视图.png');assert.equal(image.relativePath,'三视图/正视图.png');assert.equal(image.type,'image/png');
+ assert.deepEqual(new Uint8Array(await image.arrayBuffer()),bytes);
+ assert.deepEqual(progress.map(item=>item.received),[0,2,5]);assert(progress.every(item=>item.total===5&&item.filename===image.name));
+ const download=calls.at(-1);assert.equal(download.method,'GET');assert.equal(download.headers.get('Authorization'),'Bearer '+grant().token);assert(download.signal);assert(!download.path.includes('token'));assert(!download.signal.aborted);
+});
+
+test('video-only download infers MIME and total from response headers without fetching any FBX',async()=>{
+ const {api,calls}=harness(call=>call.path==='/api/login'?json(grant()):new Response('mp4bytes',{headers:{'content-type':'video/mp4','content-length':'8'}}));
+ await api.loginWithCode('synthetic');const progress=[];
+ const video=await api.downloadFile({id:'video-1',name:'动画.mp4'},{onProgress:item=>progress.push(item)});
+ assert.equal(video.type,'video/mp4');assert.equal(video.relativePath,'动画.mp4');assert.equal(progress.at(-1).received,8);assert.equal(progress.at(-1).total,8);
+ assert.deepEqual(calls.filter(call=>call.path.startsWith('/api/files/')).map(call=>call.path),['/api/files/video-1']);
+});
+
+test('single-file 401 clears the current login and notifies the existing logout hook once',async()=>{
+ let unauthorized=0;const {api,storage,calls}=harness(call=>call.path==='/api/login'?json(grant()):json({error:'会话过期'},401),{onUnauthorized:()=>unauthorized++});
+ await api.loginWithCode('synthetic');await assert.rejects(api.downloadFile({id:'image-1',name:'front.jpg'}),error=>error.status===401&&error.message==='会话过期');
+ assert.equal(unauthorized,1);assert.equal(storage.map.size,0);assert.equal(await api.role(),null);assert.equal(calls.length,2);
+});
+
+test('cancelling a single-file preview aborts its stream and a pre-cancelled download sends no request',async()=>{
+ let cancelled=0;const controller=new AbortController();
+ const {api,calls}=harness(call=>call.path==='/api/login'?json(grant()):new Response(new ReadableStream({start(stream){stream.enqueue(new Uint8Array([1,2]));},cancel(){cancelled++;}})));
+ await api.loginWithCode('synthetic');
+ await assert.rejects(api.downloadFile({id:'image-1',name:'front.png'},{signal:controller.signal,onProgress:({received})=>{if(received)controller.abort();}}),error=>error.name==='AbortError');
+ assert(calls.at(-1).signal.aborted);assert(cancelled>=1);assert.equal(await api.role(),'owner');
+ const before=calls.length;await assert.rejects(api.downloadFile({id:'image-2',name:'side.png'},{signal:controller.signal}),error=>error.name==='AbortError');assert.equal(calls.length,before);
+});
+
+test('idle download deadlines bound a hung fetch, a stalled stream and a stalled non-streaming body',async()=>{
+ for(const mode of ['fetch','stream','blob']){
+  let next=0;const timers=new Map();let abortSignal;
+  const {api}=harness(call=>{
+   if(call.path==='/api/login')return json(grant());
+   abortSignal=call.signal;
+   const expire=()=>{const idle=[...timers.values()].find(timer=>timer.ms===60000);assert(idle);idle.callback();};
+   if(mode==='fetch'){queueMicrotask(expire);return new Promise(()=>{});}
+   if(mode==='blob')return {ok:true,headers:new Headers(),blob:()=>{queueMicrotask(expire);return new Promise(()=>{});}};
+   return {ok:true,headers:new Headers(),body:{getReader:()=>({read:()=>{queueMicrotask(expire);return new Promise(()=>{});},cancel:()=>Promise.resolve()})}};
+  },{setTimeout:(callback,ms)=>{const id=++next;timers.set(id,{callback,ms});return id;},clearTimeout:id=>timers.delete(id)});
+  await api.loginWithCode('synthetic');await assert.rejects(api.downloadFile({id:'image-1',name:'front.png'}),error=>error.timeout&&error.message.includes('下载超时'));
+  assert(abortSignal.aborted);assert.equal(timers.size,0);assert.equal(await api.role(),'owner');
+ }
+});
+
+test('partial and failed file bodies show retryable download errors without invalidating login',async()=>{
+ for(const response of [new Response('short'),new Response(new ReadableStream({start(controller){controller.error(Error('connection reset'));}}))]){
+  const {api}=harness(call=>call.path==='/api/login'?json(grant()):response);
+  await api.loginWithCode('synthetic');await assert.rejects(api.downloadFile({id:'image-1',name:'front.png',size:20}),error=>error.network&&/下载不完整|下载中断/.test(error.message));assert.equal(await api.role(),'owner');
+ }
+});
+
+test('malformed preview metadata fails before making a remote file request',async()=>{
+ const {api,calls}=harness(()=>json(grant()));await api.loginWithCode('synthetic');
+ for(const metadata of [{name:'front.png'},{id:'image-1',name:'front.png',relative_path:'../front.png'},{id:'image-1',name:'front.png',size:201*1024*1024}])await assert.rejects(api.downloadFile(metadata));
+ assert.equal(calls.length,1);
 });
 
 test('invalid paths, file limits and insecure API origins fail before remote uploads',async()=>{
