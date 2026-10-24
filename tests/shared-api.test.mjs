@@ -308,3 +308,42 @@ test('shared boot never reads a browser-specific configuration or falls back to 
  assert(source.includes('state.cloud.importReview(asset.id,{asset,versions:versions.map(({id,number})=>({id,number})),comments},teacherGrant.token)'));
  assert(!source.includes('db.putAsset(a)'));
 });
+
+test('derived image bytes use the authenticated preview route, cache across dialogs and clear on logout',async()=>{
+ const metadata={id:V,name:'front.png',relative_path:'front.png',size:1_589_313,type:'image/png'};
+ const {api,calls}=harness(call=>call.path==='/api/login'?json(grant()):call.path==='/api/logout'?json({ok:true}):new Response('small-jpeg',{headers:{'content-type':'image/jpeg','content-length':'10'}}));
+ await api.loginWithCode('synthetic');
+ const first=await api.downloadImagePreview(metadata);assert.equal(first.type,'image/jpeg');assert.equal(first.size,10);
+ assert.equal(calls.at(-1).path,'/api/files/'+V+'/preview');
+ const count=calls.length;assert.equal(await api.downloadImagePreview(metadata),first);assert.equal(calls.length,count);
+ await api.logout();await assert.rejects(api.downloadImagePreview(metadata),error=>error.status===401);
+ await api.loginWithCode('synthetic');await api.downloadImagePreview(metadata);
+ assert.equal(calls.filter(call=>call.path.endsWith('/preview')).length,2);
+ await assert.rejects(api.downloadImagePreview({...metadata,name:'model.fbx'}),/JPG/);
+});
+
+test('preview cache respects its byte budget and ignores downloads completed after logout',async()=>{
+ const image=id=>({id,name:id+'.png',size:1_500_000,type:'image/png'});
+ const {api,calls}=harness(call=>call.path==='/api/login'?json(grant()):json({ok:true}));
+ await api.loginWithCode('synthetic');
+ // Reuse the real downloader with a deterministic response just below its limit.
+ const {api:bounded,calls:boundedCalls}=harness(call=>call.path==='/api/login'?json(grant()):new Response(new Uint8Array(512*1024),{headers:{'content-type':'image/jpeg'}}));
+ await bounded.loginWithCode('synthetic');
+ for(let i=0;i<17;i++)await bounded.downloadImagePreview(image('page-'+i));
+ const before=boundedCalls.length;await bounded.downloadImagePreview(image('page-16'));assert.equal(boundedCalls.length,before);
+ await bounded.downloadImagePreview(image('page-0'));assert.equal(boundedCalls.length,before+1);
+ let resolveBody;
+ const late=harness(call=>call.path==='/api/login'?json(grant()):call.path==='/api/logout'?json({ok:true}):new Response(new ReadableStream({start(controller){resolveBody=()=>{controller.enqueue(new Uint8Array([1]));controller.close();};}})));
+ await late.api.loginWithCode('synthetic');const pending=late.api.downloadImagePreview(image('late'));
+ await new Promise(resolve=>setImmediate(resolve));await late.api.logout();resolveBody();await assert.rejects(pending,{name:'AbortError'});
+ assert.equal(calls.length,1);
+});
+
+test('derived previews upload separately from committed source files and cannot be supplied as FBX previews',async()=>{
+ const metadata={id:V,name:'front.png',size:1_500_000,type:'image/png'};
+ const {api,calls}=harness(call=>call.path==='/api/login'?json(grant()):json({ok:true}));await api.loginWithCode('synthetic');
+ const blob=new Blob(['jpeg'],{type:'image/jpeg'});
+ assert.deepEqual(await api.uploadImagePreviews({files:[metadata]},[{name:metadata.name,blob}]),{failures:[]});
+ assert.equal(calls.at(-1).path,'/api/files/'+V+'/preview');assert.equal(calls.at(-1).method,'PUT');assert.equal(calls.at(-1).body,blob);
+ await assert.rejects(api.uploadImagePreviews({files:[{...metadata,name:'source.fbx'}]},[{name:'source.fbx',blob}]),/无效/);
+});

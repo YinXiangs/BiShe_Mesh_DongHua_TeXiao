@@ -100,3 +100,30 @@ test('comment restoration loads its recorded image page and never preloads the r
   await review.restore({ mediaIndex: 2, filename: 'back.png', mediaType: 'image' });
   assert.deepEqual(calls, ['back']); assert.equal(review.index, 2); assert.equal(review.context().filename, 'back.png');
 });
+
+test('a lightweight review image replaces the existing cover without requesting the original; original remains click-only', async t => {
+  const cover = 'data:image/jpeg;base64,Y292ZXI=';
+  let resolvePreview; const calls = [];
+  const version = mediaVersion([file('front', 'front.png', 'image/png')], { stats: { reviewMode: 'media-v1', thumbnail: cover } });
+  const { review, host } = environment(t, version, async metadata => { calls.push('original:' + metadata.id); return bytes(metadata); });
+  review.cloud.downloadImagePreview = async metadata => { calls.push('preview:' + metadata.id); return new Promise(resolve => { resolvePreview = resolve; }); };
+  const pending = review.start();
+  assert.equal(host.children[0].src, cover); assert.deepEqual(calls, ['preview:front']);
+  resolvePreview(bytes(version.files[0])); await pending;
+  assert(host.children[1].children[1].textContent.startsWith('查看原图'));
+  await host.children[1].children[1].onclick();
+  // The click handler intentionally starts an asynchronous page transition.
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ['preview:front', 'original:front']);
+  assert.equal(host.children[1].children[1].textContent, '返回评审图');
+  await review.showPage(0); assert.deepEqual(calls, ['preview:front', 'original:front']);
+});
+
+test('missing derived preview falls back only to its image, while network failures do not start a larger download', async t => {
+  const calls = [];
+  const { review, host } = environment(t, mediaVersion([file('front', 'front.png', 'image/png'), file('side', 'side.png', 'image/png')]), async metadata => { calls.push(metadata.id); return bytes(metadata); });
+  review.cloud.downloadImagePreview = async metadata => { throw Object.assign(Error('preview unavailable'), { status: metadata.id === 'front' ? 404 : 503 }); };
+  await review.start(); assert.deepEqual(calls, ['front']);
+  await review.showPage(1); assert.deepEqual(calls, ['front']);
+  assert.equal(host.children[0].children[0].textContent, '预览加载未完成');
+});

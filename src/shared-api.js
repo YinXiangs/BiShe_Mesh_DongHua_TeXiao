@@ -5,6 +5,8 @@ const MAX_FILE_BYTES = 200 * 1024 * 1024;
 const MAX_VERSION_BYTES = 300 * 1024 * 1024;
 const DOWNLOAD_IDLE_MS = 60_000;
 const DOWNLOAD_TOTAL_MS = 300_000;
+const PREVIEW_MAX_BYTES = 512 * 1024;
+const PREVIEW_CACHE_BYTES = 8 * 1024 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const uuid = value => { if (!UUID.test(value || '')) throw Error('作品或版本编号无效。'); return encodeURIComponent(value); };
 const unwrap = (data, key) => data?.[key] ?? data;
@@ -50,6 +52,7 @@ export function createSharedApi(config, options = {}) {
   if (storage === undefined) { try { storage = globalThis.sessionStorage; } catch { storage = null; } }
   const key = SESSION_KEY + base;
   let session = null;
+  const previewCache = new Map(); let previewCacheBytes = 0, sessionGeneration = 0;
   try { session = JSON.parse(storage?.getItem(key) || 'null'); } catch { /* An invalid local login is discarded. */ }
 
   function expiry(value) { return typeof value === 'number' ? value : Date.parse(value); }
@@ -57,12 +60,13 @@ export function createSharedApi(config, options = {}) {
     return Boolean(value && typeof value.token === 'string' && value.token.length >= 20
       && ['student', 'teacher'].includes(value.role) && expiry(value.expiresAt) > now());
   }
-  function clear() { session = null; try { storage?.removeItem(key); } catch { /* Best effort. */ } }
+  function clear() { session = null; sessionGeneration++; previewCache.clear(); previewCacheBytes = 0; try { storage?.removeItem(key); } catch { /* Best effort. */ } }
   if (!validSession(session)) clear();
   function savedGrant(grant) {
     if (!validSession(grant)) throw Error('共享服务返回的登录信息无效。');
     if (!storage) throw Error('当前浏览器无法保存登录，请允许网站使用会话存储。');
     storage.setItem(key, JSON.stringify(grant));
+    if (session?.token !== grant.token) { sessionGeneration++; previewCache.clear(); previewCacheBytes = 0; }
     session = grant;
   }
   async function request(path, { method = 'GET', json, body, token, anonymous = false, raw = false, signal } = {}) {
@@ -198,10 +202,11 @@ export function createSharedApi(config, options = {}) {
       throw error;
     }
   }
-  async function downloadFile(metadata, { onProgress, signal } = {}) {
+  async function downloadFile(metadata, { onProgress, signal, imagePreview = false } = {}) {
     if (!metadata || typeof metadata.id !== 'string' || !metadata.id) throw Error('下载文件编号无效。');
     const relativePath = relativeFileName({ name: metadata.name, relativePath: metadata.relative_path });
-    const expectedSize = Number.isSafeInteger(metadata.size) && metadata.size > 0 ? metadata.size : 0;
+    const expectedSize = !imagePreview && Number.isSafeInteger(metadata.size) && metadata.size > 0 ? metadata.size : 0;
+    const maxBytes = imagePreview ? PREVIEW_MAX_BYTES : MAX_FILE_BYTES;
     if (expectedSize > MAX_FILE_BYTES) throw Error('文件超过单文件 200 MB 的下载上限。');
     const aborted = () => Object.assign(Error('已取消文件下载。'), { name: 'AbortError' });
     if (signal?.aborted) throw aborted();
@@ -224,7 +229,7 @@ export function createSharedApi(config, options = {}) {
     try {
       const operation = (async () => {
         // Files remain authenticated. Never put a login token into a preview or download URL.
-        const response = await request('/files/' + encodeURIComponent(metadata.id), { raw: true, signal: controller.signal });
+        const response = await request('/files/' + encodeURIComponent(metadata.id) + (imagePreview ? '/preview' : ''), { raw: true, signal: controller.signal });
         if (controller.signal.aborted) throw aborted();
         resetIdle();
         const contentLength = Number(response.headers?.get('content-length'));
@@ -241,19 +246,20 @@ export function createSharedApi(config, options = {}) {
             if (controller.signal.aborted) throw aborted();
             if (done) break;
             received += value.byteLength;
-            if (received > MAX_FILE_BYTES) throw Error('文件超过单文件 200 MB 的下载上限。');
+            if (received > maxBytes) throw Error(imagePreview ? '评审图片过大。' : '文件超过单文件 200 MB 的下载上限。');
             chunks.push(value); resetIdle(); progress();
           }
         } else {
           const blob = await response.blob();
           if (controller.signal.aborted) throw aborted();
           received = blob.size;
-          if (received > MAX_FILE_BYTES) throw Error('文件超过单文件 200 MB 的下载上限。');
+          if (received > maxBytes) throw Error(imagePreview ? '评审图片过大。' : '文件超过单文件 200 MB 的下载上限。');
           chunks.push(blob); progress();
         }
-        if (expectedSize && received !== expectedSize) throw Object.assign(Error('文件下载不完整，请重新下载。'), { network: true });
+        if ((expectedSize || (imagePreview && total)) && received !== total) throw Object.assign(Error('文件下载不完整，请重新下载。'), { network: true });
+        if (imagePreview && !received) throw Object.assign(Error('评审图片为空，请重试。'), { network: true });
         if (controller.signal.aborted) throw aborted();
-        const file = new File(chunks, metadata.name, { type: metadata.type || response.headers?.get('content-type') || 'application/octet-stream' });
+        const file = new File(chunks, metadata.name, { type: imagePreview ? 'image/jpeg' : metadata.type || response.headers?.get('content-type') || 'application/octet-stream' });
         Object.defineProperty(file, 'relativePath', { value: relativePath });
         completed = true;
         return file;
@@ -272,6 +278,38 @@ export function createSharedApi(config, options = {}) {
       }
     }
   }
+  async function downloadImagePreview(metadata, options = {}) {
+    if (!validSession(session)) { clear(); throw Object.assign(Error('登录已过期，请重新输入访问密码。'), { status: 401 }); }
+    if (!/\.(jpe?g|png)$/i.test(metadata?.name || '')) throw Error('只有 JPG / PNG 可以加载评审图片。');
+    if (options.signal?.aborted) throw cancelled();
+    const cached = previewCache.get(metadata.id);
+    if (cached) {
+      previewCache.delete(metadata.id); previewCache.set(metadata.id, cached);
+      options.onProgress?.({ received: cached.size, total: cached.size, filename: metadata.name }); return cached;
+    }
+    const generation = sessionGeneration;
+    const result = await downloadFile(metadata, { ...options, imagePreview: true });
+    if (generation !== sessionGeneration || !validSession(session)) throw cancelled();
+    while (previewCache.size && previewCacheBytes + result.size > PREVIEW_CACHE_BYTES) {
+      const oldest = previewCache.keys().next().value; previewCacheBytes -= previewCache.get(oldest).size; previewCache.delete(oldest);
+    }
+    // Concurrent requests for the same page must not count the same bytes twice.
+    if (previewCache.has(metadata.id)) previewCacheBytes -= previewCache.get(metadata.id).size;
+    previewCache.set(metadata.id, result); previewCacheBytes += result.size;
+    return result;
+  }
+  async function uploadImagePreviews(version, previews = [], onProgress) {
+    const failures = [];
+    for (let index = 0; index < previews.length; index++) {
+      const preview = previews[index];
+      const file = version.files?.find(file => file.name === preview.name && /\.(jpe?g|png)$/i.test(file.name));
+      if (!file || !(preview.blob instanceof Blob) || preview.blob.type !== 'image/jpeg' || !preview.blob.size || preview.blob.size > PREVIEW_MAX_BYTES) throw Error('轻量评审图片无效。');
+      try { await request('/files/' + encodeURIComponent(file.id) + '/preview', { method: 'PUT', body: preview.blob }); }
+      catch (error) { if (error.status === 401 || error.status === 403) throw error; failures.push(preview.name); }
+      onProgress?.({ completed: index + 1, total: previews.length });
+    }
+    return { failures };
+  }
   async function downloadVersion(version, options = {}) {
     if (!version.files?.length) return [];
     // Sequential reads bound memory and simultaneous QQ webview requests.
@@ -286,7 +324,7 @@ export function createSharedApi(config, options = {}) {
     listAssets, listDeletedAssets: async () => (await request('/assets?deleted=1')).assets,
     createAsset: async ({ id, title, category, description }) => unwrap(await request('/assets', { method: 'POST', json: { id, title, category, description } }), 'asset'),
     saveAsset: async ({ id, title, description }) => unwrap(await request('/assets/' + uuid(id), { method: 'PATCH', json: { title, description } }), 'asset'),
-    listVersions, uploadVersion, downloadFile, downloadVersion,
+    listVersions, uploadVersion, downloadFile, downloadVersion, downloadImagePreview, uploadImagePreviews,
     listComments: async id => (await request('/assets/' + uuid(id) + '/comments')).comments,
     addComment: async comment => unwrap(await request('/comments', { method: 'POST', json: comment }), 'comment'),
     reviewAsset: async (id, status, versionId) => unwrap(await request('/assets/' + uuid(id) + '/review', { method: 'POST', json: { status, versionId } }), 'asset'),

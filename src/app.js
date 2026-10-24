@@ -306,7 +306,9 @@ function upload(detail){
    button.textContent='正在上传…';requireStudent();
    const version=await state.cloud.uploadVersion(a.id,pendingVersion,prepared.files,({sent,total})=>{button.textContent='正在上传 '+Math.round(sent/total*100)+'%…';});
    if(state.selected?.id===a.id&&!state.versions.some(row=>row.id===version.id))state.versions.unshift(version);
-   const changedAsset={...a,status:'review',teacher_read_version_id:null,teacher_read_at:null,updated_at:new Date().toISOString()};let warning='';
+   let warning='';
+   try{const result=await state.cloud.uploadImagePreviews(version,prepared.imagePreviews,({completed,total})=>{button.textContent='正在保存快速评审图 '+completed+' / '+total+'…';});if(result.failures.length)warning='作品已保存，部分快速评审图未能上传，暂时使用原图。';}catch{warning='作品已保存，快速评审图未能上传，暂时使用原图。';}
+   const changedAsset={...a,status:'review',teacher_read_version_id:null,teacher_read_at:null,updated_at:new Date().toISOString()};
    try{const saved=await state.cloud.saveAsset(changedAsset);Object.assign(a,saved||changedAsset);}catch{warning='版本已保存，请刷新作品确认进度。';}
    assetPreviews.set(previewKey(a,source),{versionId:version.id,thumbnail:prepared.thumbnail});
    if(prepared.thumbnail)void writePreview(source.scope,version.id,prepared.thumbnail);

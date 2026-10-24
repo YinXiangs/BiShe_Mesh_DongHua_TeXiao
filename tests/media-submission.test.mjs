@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifySubmissionFiles, containImage, MEDIA_SIZE, prepareSubmissionMedia } from '../src/submission-media.js';
+import { classifySubmissionFiles, containImage, MEDIA_SIZE, prepareSubmissionMedia, encodeReviewPreview, REVIEW_PREVIEW_MAX_BYTES } from '../src/submission-media.js';
 
 const file = (name, size = 100, extras = {}) => ({ name, size, ...extras });
 const thumbnail = 'data:image/jpeg;base64,aW1hZ2U=';
@@ -95,4 +95,22 @@ test('default image preparation rejects disguised JPG and PNG headers before any
     const input = new File(['<html>Not an image</html>'], name, { type: name.endsWith('png') ? 'image/png' : 'image/jpeg' });
     await assert.rejects(prepareSubmissionMedia('scene', [input]), /内容不是有效的/);
   }
+});
+
+test('review JPEG uses bounded bytes without changing canvas resolution and keeps originals separate', async () => {
+  const qualities = [], sizes = [700_000, 280_000];
+  const canvas = { width: 1920, height: 1080, toBlob(callback, type, quality) { qualities.push(quality); callback(new Blob([new Uint8Array(sizes.shift())], { type })); } };
+  const result = await encodeReviewPreview(canvas);
+  assert.equal(result.type, 'image/jpeg'); assert(result.size <= REVIEW_PREVIEW_MAX_BYTES);
+  assert.deepEqual(qualities, [0.78, 0.65]); assert.deepEqual([canvas.width, canvas.height], [1920, 1080]);
+  const original = file('source.png');
+  const prepared = await prepareSubmissionMedia('scene', [original], { prepareImage: async () => ({ file: original, thumbnail, preview: result }) });
+  assert.equal(prepared.files[0], original); assert.equal(prepared.imagePreviews[0].blob, result);
+  assert.equal(prepared.imagePreviews[0].name, original.name); assert.equal(prepared.files.length, 1);
+});
+
+test('review encoder rejects unsupported JPEG and cancellation before returning preview bytes', async () => {
+  await assert.rejects(encodeReviewPreview({ toBlob: callback => callback(new Blob(['png'], { type: 'image/png' })) }), /JPG/);
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(encodeReviewPreview({ toBlob() { assert.fail('cancelled encoder ran'); } }, { signal: controller.signal }), { name: 'AbortError' });
 });

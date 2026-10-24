@@ -31,14 +31,14 @@ export function boundedMediaIndex(index, length) {
   return Math.max(0, Math.min(Math.max(0, length - 1), Number.isInteger(index) ? index : 0));
 }
 
-const byteLabel = bytes => (Number(bytes || 0) / 1048576).toFixed(1) + ' MB';
+const byteLabel = bytes => Number(bytes || 0) < 1048576 ? Math.ceil(Number(bytes || 0) / 1024) + ' KB' : (Number(bytes || 0) / 1048576).toFixed(1) + ' MB';
 
 /** Only the visible image or an explicitly requested MP4 is fetched. */
 export class MediaReview {
   constructor({ host, controls, version, cloud, onReady = () => {}, onUpdate = () => {} }) {
     this.host = host; this.controls = controls; this.version = version; this.cloud = cloud;
     this.onReady = onReady; this.onUpdate = onUpdate; this.plan = planReviewMedia(version);
-    this.index = 0; this.serial = 0; this.dead = false; this.urls = new Set(); this.cache = new Map();
+    this.index = 0; this.serial = 0; this.dead = false; this.urls = new Set(); this.cache = new Map(); this.optimized = new Set();
     this.host.classList.add('media-review-host'); this.host.tabIndex = 0;
     this.keydown = event => {
       if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
@@ -85,13 +85,36 @@ export class MediaReview {
     const detail = document.createElement('p'); detail.textContent = text; box.append(heading, detail); this.host.replaceChildren(box);
     return { box, detail };
   }
-  async getFile(file, progress, signal) {
-    if (this.cache.has(file.id)) return this.cache.get(file.id);
-    const result = await this.cloud.downloadFile(file, { onProgress: progress, signal });
+  async getFile(file, progress, signal, original = false) {
+    const key = original ? file.id + ':original' : file.id;
+    if (this.cache.has(key)) return this.cache.get(key);
+    let result;
+    if (!original && imageFile(file) && this.cloud.downloadImagePreview) {
+      try { result = await this.cloud.downloadImagePreview(file, { onProgress: progress, signal }); this.optimized.add(file.id); }
+      catch (error) { if (error.status !== 404) throw error; }
+    }
+    if (!result) result = await this.cloud.downloadFile(file, { onProgress: progress, signal });
     if (signal.aborted || !this.current()) throw Object.assign(Error('已取消预览。'), { name: 'AbortError' });
-    const url = URL.createObjectURL(result); this.urls.add(url); this.cache.set(file.id, url); return url;
+    const url = URL.createObjectURL(result); this.urls.add(url); this.cache.set(key, url); return url;
   }
-  async showPage(index) {
+  displayImage(slide, src, serial, { loading = false, original = false, hint = '' } = {}) {
+    const image = document.createElement('img'); image.className = 'review-image';
+    image.alt = slide.kind === 'thumbnail' ? '已有版本预览图片' : '第 ' + (this.index + 1) + ' 张作品图片 · ' + slide.file.name;
+    image.onload = () => { if (!loading && this.current() && serial === this.serial) { this.onReady(); this.onUpdate(this.context()); } };
+    image.onerror = () => { if (!loading) this.failed('图片无法显示，请重新提交 JPG 或 PNG。', serial); };
+    image.src = src; this.host.replaceChildren(image); this.visibleImage = { index: this.index, src };
+    const bar = document.createElement('div'); bar.className = 'media-image-status';
+    const detail = document.createElement('span'); detail.setAttribute('aria-live', 'polite');
+    detail.textContent = hint || (loading ? '正在加载评审图…' : slide.kind === 'thumbnail' ? '已有预览图 · 可提交三视图新版本' : original || !this.optimized.has(slide.file.id) ? '原始图片' : '评审图 · 1920×1080');
+    bar.append(detail);
+    if (!loading && slide.kind === 'image' && this.optimized.has(slide.file.id)) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'button ghost small';
+      button.textContent = original ? '返回评审图' : '查看原图 · ' + byteLabel(slide.file.size);
+      button.onclick = () => void this.showPage(this.index, { original: !original }); bar.append(button);
+    }
+    this.host.append(bar); return detail;
+  }
+  async showPage(index, { original = false } = {}) {
     if (!this.current()) return;
     this.controller?.abort(); this.controller = new AbortController();
     this.releaseVideo(); this.index = boundedMediaIndex(index, this.plan.slides.length); const serial = ++this.serial;
@@ -108,18 +131,22 @@ export class MediaReview {
       const button = document.createElement('button'); button.type = 'button'; button.className = 'button primary'; button.textContent = '加载并播放 MP4 · ' + byteLabel(slide.file.size);
       button.onclick = () => void this.playVideo(slide, serial); box.append(button); return;
     }
-    const { detail } = this.message('正在加载图片…');
+    const placeholder = original && this.visibleImage?.index === this.index ? this.visibleImage.src
+      : this.index === 0 && !this.plan.video ? this.plan.thumbnail : null;
+    const detail = placeholder ? this.displayImage(slide, placeholder, serial, { loading: true, hint: original ? '正在加载原图…' : '预览已显示，正在加载清晰评审图…' })
+      : this.message(original ? '正在加载原图…' : '正在加载评审图片…').detail;
     try {
       const src = slide.kind === 'thumbnail' ? slide.thumbnail : await this.getFile(slide.file, ({ received, total }) => {
-        if (this.current() && serial === this.serial) detail.textContent = byteLabel(received) + (total ? ' / ' + byteLabel(total) : '');
-      }, this.controller.signal);
+        if (this.current() && serial === this.serial) detail.textContent = (original ? '原图 ' : '评审图 ') + byteLabel(received) + (total ? ' / ' + byteLabel(total) : '');
+      }, this.controller.signal, original);
       if (!this.current() || serial !== this.serial) return;
-      const image = document.createElement('img'); image.className = 'review-image'; image.alt = slide.kind === 'thumbnail' ? '已有版本预览图片' : '第 ' + (this.index + 1) + ' 张作品图片 · ' + slide.file.name;
-      image.onload = () => { if (this.current() && serial === this.serial) { this.onReady(); this.onUpdate(this.context()); } };
-      image.onerror = () => this.failed('图片无法显示，请重新提交 JPG 或 PNG。', serial);
-      image.src = src; this.host.replaceChildren(image);
-      if (slide.kind === 'thumbnail') { const note = document.createElement('span'); note.className = 'media-legacy-note'; note.textContent = '已有预览图 · 可提交三视图新版本'; this.host.append(note); }
-    } catch (error) { if (error.name !== 'AbortError') this.failed(error.message, serial); }
+      this.displayImage(slide, src, serial, { original });
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        if (original && placeholder && this.current() && serial === this.serial) this.displayImage(slide, placeholder, serial, { hint: '原图未能加载，可重试；评审图已保留。' });
+        else this.failed(error.message, serial);
+      }
+    }
   }
   failed(message, serial) {
     if (!this.current() || serial !== this.serial) return;

@@ -17,6 +17,7 @@ const ROUTES = [
   ['GET', new RegExp(`^/api/assets/${ID}/(versions|comments)$`)],
   ['POST', new RegExp(`^/api/assets/${ID}/(delete|restore|review|read|uploads|import-review)$`)],
   ['GET', new RegExp(`^/api/files/${ID}$`)],
+  ['GET|PUT', new RegExp(`^/api/files/${ID}/preview$`)],
   ['DELETE', new RegExp(`^/api/uploads/${ID}$`)],
   ['POST', new RegExp(`^/api/uploads/${ID}/commit$`)],
   ['PUT', new RegExp(`^/api/uploads/${ID}/files/${ID}/parts/[0-9]{1,5}$`)],

@@ -1,6 +1,7 @@
 import { relativeFilePath, validateFiles } from './validation.js';
 
 export const MEDIA_SIZE = Object.freeze({ width: 1920, height: 1080 });
+export const REVIEW_PREVIEW_MAX_BYTES = 512 * 1024;
 const THUMBNAIL_SIZE = Object.freeze({ width: 480, height: 270 });
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png']);
 const extension = file => String(file?.name || file?.filename || '').split('.').at(-1).toLowerCase();
@@ -70,7 +71,8 @@ export async function prepareSubmissionMedia(category, inputFiles, options = {})
     ...(videoPreview?.stats?.duration != null ? { duration: videoPreview.stats.duration } : {}),
     media: { images: preparedImages.map(image => image.file.name), video: plan.videoFile?.name || null },
   };
-  return { files, mainFile: finalPlan.mainFile, thumbnail: videoPreview?.thumbnail || preparedImages[0]?.thumbnail, stats };
+  return { files, mainFile: finalPlan.mainFile, thumbnail: videoPreview?.thumbnail || preparedImages[0]?.thumbnail, stats,
+    imagePreviews: preparedImages.filter(image => image.preview).map(image => ({ name: image.file.name, blob: image.preview })) };
 }
 
 function isThumbnail(value) { return typeof value === 'string' && /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(value); }
@@ -137,6 +139,19 @@ function thumbnailFrom(source, width, height) {
   finally { canvas.width = canvas.height = 1; }
 }
 
+// A separate JPEG keeps every review page at 1920×1080 while preserving the
+// submitted PNG/JPG. Neither the FBX nor the original image is replaced.
+export async function encodeReviewPreview(canvas, { signal } = {}) {
+  for (const quality of [0.78, 0.65, 0.5, 0.36]) {
+    checkSignal(signal);
+    const blob = await bounded(new Promise((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(Error('评审图片编码失败。')), 'image/jpeg', quality)), { signal });
+    checkSignal(signal);
+    if (blob.type !== 'image/jpeg') throw Error('当前浏览器无法生成 JPG 评审图片。');
+    if (blob.size <= REVIEW_PREVIEW_MAX_BYTES) return blob;
+  }
+  throw Error('图片细节过多，无法生成轻量评审图，请降低噪点后重试。');
+}
+
 async function browserPrepareImage(file, { signal }) {
   await verifyImageHeader(file, signal);
   checkSignal(signal);
@@ -165,7 +180,7 @@ async function browserPrepareImage(file, { signal }) {
     checkSignal(signal);
     if (blob.type !== type) throw Error(`浏览器未能生成正确的 ${type === 'image/png' ? 'PNG' : 'JPG'} 格式，请更换浏览器重试。`);
     const output = new File([blob], file.name, { type, lastModified: file.lastModified || Date.now() });
-    return { file: output, thumbnail: thumbnailFrom(canvas, canvas.width, canvas.height) };
+    return { file: output, thumbnail: thumbnailFrom(canvas, canvas.width, canvas.height), preview: await encodeReviewPreview(canvas, { signal }) };
   } finally {
     image.removeAttribute('src'); image.remove(); URL.revokeObjectURL(url);
     if (canvas) canvas.width = canvas.height = 1;
