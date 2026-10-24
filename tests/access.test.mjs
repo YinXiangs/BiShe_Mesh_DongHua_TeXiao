@@ -1,9 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
-  digestPassword, verifyEntryPassword, readEntrySession, saveEntrySession,
+  readEntrySession, saveEntrySession,
   clearEntrySession, submissionAllowed, reviewAllowed,
 } from '../src/access.js';
 
@@ -20,28 +19,12 @@ function memoryStorage() {
   };
 }
 
-test('password fingerprint uses the exact namespace and does not normalize the submitted secret', async () => {
-  const password = 'test-only synthetic passphrase';
-  assert.equal(await digestPassword(password), createHash('sha256').update('qixi-entry-v1:' + password).digest('hex'));
-  assert.notEqual(await digestPassword(password), await digestPassword(' ' + password));
-  assert.equal(await verifyEntryPassword(password), null);
-  assert.equal(await verifyEntryPassword(''), null);
-  assert.equal(await verifyEntryPassword(null), null);
-  await assert.rejects(digestPassword({}), TypeError);
-});
-
-test('configured synthetic fingerprints select the corresponding role and reject a wrong password', async () => {
-  const teacherPassword = 'synthetic teacher passphrase';
-  const studentPassword = 'synthetic student passphrase';
-  // Swap public fingerprints in an isolated copy, never real deployment passwords.
-  const source = (await readFile(new URL('../src/access.js', import.meta.url), 'utf8'))
-    .replace(/const TEACHER_DIGEST = '[^']*';/, `const TEACHER_DIGEST = '${await digestPassword(teacherPassword)}';`)
-    .replace(/const STUDENT_DIGEST = '[^']*';/, `const STUDENT_DIGEST = '${await digestPassword(studentPassword)}';`);
-  const isolated = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
-  assert.equal(await isolated.verifyEntryPassword(teacherPassword), 'teacher');
-  assert.equal(await isolated.verifyEntryPassword(studentPassword), 'student');
-  assert.equal(await isolated.verifyEntryPassword('wrong synthetic passphrase'), null);
-  assert.equal(await isolated.verifyEntryPassword(teacherPassword + ' '), null);
+test('public UI contains neither password fingerprints nor a client-side password verifier', async () => {
+  const source = await readFile(new URL('../src/access.js', import.meta.url), 'utf8');
+  assert(!source.includes('DIGEST'));
+  assert(!source.includes('verifyEntryPassword'));
+  assert(!source.includes('digestPassword'));
+  assert(!/[a-f0-9]{64}/i.test(source));
 });
 
 test('both roles persist only until the eight-hour boundary and logout clears them', () => {

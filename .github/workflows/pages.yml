@@ -22,8 +22,7 @@ jobs:
       - run: npm ci
       - name: Set public connection configuration
         env:
-          PUBLIC_SUPABASE_URL: ${{ vars.PUBLIC_SUPABASE_URL }}
-          PUBLIC_SUPABASE_ANON_KEY: ${{ vars.PUBLIC_SUPABASE_ANON_KEY }}
+          PUBLIC_API_URL: ${{ vars.PUBLIC_API_URL }}
           GITHUB_REPOSITORY_NAME: ${{ github.repository }}
         run: node scripts/write-config.mjs
       - run: npm test

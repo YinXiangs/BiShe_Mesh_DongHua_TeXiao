@@ -6,10 +6,10 @@ import { PREVIEW_REVISION } from './material-preview.js';
 import { buildReviewRecord, formatReviewRecordText } from './review-records.js';
 import { db } from './local-db.js';
 import { validateFiles } from './validation.js';
-import { createCloud } from './cloud.js';
+import { createSharedApi, planLegacyVersions } from './shared-api.js';
 import { generateMediaThumbnail } from './thumbnails.js';
 import { readPreview, writePreview, validPreview } from './preview-cache.js';
-import { verifyEntryPassword, readEntrySession, saveEntrySession, clearEntrySession, submissionAllowed, reviewAllowed } from './access.js';
+import { readEntrySession, saveEntrySession, clearEntrySession, submissionAllowed, reviewAllowed } from './access.js';
 import { zipSync } from 'fflate';
 
 const CATS={all:'全部作品',scene:'场景建模',character:'角色建模',product:'产品建模',animation:'游戏动画',vfx:'游戏特效'};
@@ -24,7 +24,7 @@ const date=s=>new Date(s).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',
 const size=n=>n>=1048576?(n/1048576).toFixed(1)+' MB':Math.ceil(n/1024)+' KB';
 const demoSpecs=[['scene','邮局主建筑','木屋、门廊与信件投递区','review'],['character','森林邮差','角色比例与服装层次','pending'],['product','林间邮筒','投信口、门板与金属细节','approved'],['animation','信使飞行循环','动作节奏与循环衔接','changes'],['scene','山谷投递站','环境空间与场景搭建','pending'],['vfx','邮戳光效','MP4 特效视频提交入口','review']];
 const DEMOS=demoSpecs.map(([category,title,description,status],i)=>({id:'demo-'+i,category,title,description,status,demo:true,created_at:new Date().toISOString()}));
-const state={assets:[],category:'all',status:'all',query:'',mode:'local',demo:false,cloud:null,role:null,config:{githubRepo:'YinXiangs/BiShe_Mesh_DongHua_TeXiao'},deployedConfig:null,accessError:null,shared:null,token:new URLSearchParams(location.hash.slice(1)).get('review'),selected:null,versions:[],comments:[],files:[],viewer:null,video:null,version:null};
+const state={assets:[],category:'all',status:'all',query:'',mode:'cloud',demo:false,cloud:null,role:null,config:{githubRepo:'YinXiangs/BiShe_Mesh_DongHua_TeXiao'},deployedConfig:null,accessError:null,shared:null,token:null,selected:null,versions:[],comments:[],files:[],viewer:null,video:null,version:null,serviceReady:false,booting:true,assetsReady:false,legacyAssets:[],migrationBusy:false};
 const app=document.querySelector('#app');
 state.entryRole=null;
 let toastTimer, loadSerial=0, feedbackMutationSerial=0, feedbackWrites=0;
@@ -46,16 +46,19 @@ async function refresh(){
   if(!state.entryRole){renderAccess();return;}
   assetPreviews.clear();previewObserver?.disconnect();
   state.accessError=null;
-  if(state.token){
-    state.mode='guest';state.demo=false;
-    try{if(!state.cloud)throw Error('共享存储尚未配置，请联系项目所有者完成网站配置。');state.shared=await state.cloud.getSharedData(state.token);state.assets=state.shared.assets;}
-    catch(error){state.shared=null;state.assets=[];state.accessError=error.message||'评审链接暂时无法打开。';}
-  }
-  else if(state.mode==='cloud'){state.role=await state.cloud.role();if(!state.role){state.assets=[];}else state.assets=await state.cloud.listAssets();state.demo=false;}
-  else{state.assets=await db.getAssets();state.demo=state.entryRole==='student'&&state.assets.length===0&&state.mode!=='empty';if(state.mode==='empty')state.mode='local';}
+  try{
+    if(!state.serviceReady||!state.cloud)throw Error('共享服务尚未连接，不能读取作品；请稍后重试。');
+    state.role=await state.cloud.role();
+    if(!state.role){leaveSession();return;}
+    const assets=await state.cloud.listAssets();
+    if(!Array.isArray(assets))throw Error('作品列表响应异常，请稍后重试。');
+    if(!state.entryRole)return;
+    state.assets=assets;state.assetsReady=true;state.demo=false;state.mode='cloud';
+    if(state.entryRole==='student'){try{state.legacyAssets=await findLegacyAssets();}catch{state.legacyAssets=[];}}
+  }catch(error){if(!state.entryRole)return;state.accessError=error.message||'共享作品暂时无法读取。';}
   render();
 }
-function currentAssets(){return state.demo?DEMOS:state.assets;}
+function currentAssets(){return state.assets;}
 function canEdit(){return submissionAllowed(state.entryRole,{token:state.token,mode:state.mode,cloudRole:state.role});}
 function canReview(){return reviewAllowed(state.entryRole,{token:state.token,mode:state.mode,cloudRole:state.role});}
 function requireStudent(){if(readEntrySession()!=='student'||!canEdit())throw Error('学生身份才能提交、修改或删除作品。');}
@@ -64,27 +67,32 @@ function renderAccess(){
  previewObserver?.disconnect();
  app.innerHTML='<main class="access-screen"><section class="access-card"><div class="access-brand">'+ico('mail')+'<span>栖息邮局</span></div><div class="access-eyebrow">QIXI POST OFFICE</div><h1>欢迎来到栖息邮局</h1><p class="access-subtitle">毕业设计作品与指导记录</p><form class="access-form"><label class="field">访问密码<input name="password" type="password" inputmode="numeric" autocomplete="off" required maxlength="64" placeholder="请输入访问密码" aria-label="访问密码"></label><p class="access-error" role="alert" aria-live="polite"></p><button class="button primary" type="submit">进入网站 '+ico('arrow')+'</button></form><p class="access-footer">让每一次反馈，成为下一步的方向。</p></section></main>';
  const form=app.querySelector('form');
+ form.querySelector('button').disabled=state.booting;
+ form.querySelector('.access-error').textContent=state.booting?'正在连接共享评审服务…':state.accessError||'';
  form.onsubmit=async event=>{
   event.preventDefault();const button=form.querySelector('button'),input=form.elements.password,error=form.querySelector('.access-error');button.disabled=true;error.textContent='';
   try{
-   const role=await verifyEntryPassword(input.value);input.value='';
-   if(!role){error.textContent='密码不正确，请重新输入。';input.focus();return;}
+   if(!state.serviceReady||!state.cloud)throw Error(state.accessError||'共享服务尚未连接，请刷新后重试。');
+   const grant=await state.cloud.loginWithCode(input.value);input.value='';const role=grant.role;
    if(!saveEntrySession(role))throw Error('浏览器禁止保存当前会话，请允许此网站使用会话存储后重试。');
-   state.entryRole=role;await refresh();
-   if(role==='teacher')dialog('欢迎黄静妮教授登陆网站！','<div class="welcome-panel"><div class="welcome-symbol">'+ico('mail')+'</div><h2 class="welcome-cn">欢迎黄静妮教授登陆网站！</h2><p class="welcome-en" lang="en">Welcome, Professor Huang Jingni!</p><p>期待您的指导，让每一份作品继续成长。</p>'+(state.mode==='local'?'<p class="feedback-storage">当前为本机草稿：检查结果和留言只保存在此设备，尚未同步。</p>':'')+'<button class="button primary" id="welcome-start">开始检查作品</button></div>').querySelector('#welcome-start').onclick=event=>event.target.closest('dialog').close();
+   state.entryRole=role;state.role=role==='student'?'owner':'reviewer';state.assetsReady=false;try{sessionStorage.removeItem(migrationPromptKey());}catch{}await refresh();
+   if(role==='teacher'&&!state.accessError)dialog('欢迎黄静妮教授登陆网站！','<div class="welcome-panel"><div class="welcome-symbol">'+ico('mail')+'</div><h2 class="welcome-cn">欢迎黄静妮教授登陆网站！</h2><p class="welcome-en" lang="en">Welcome, Professor Huang Jingni!</p><p>期待您的指导，让每一份作品继续成长。</p><p class="help-text">作品、检查状态与意见在手机和电脑间共享。</p><button class="button primary" id="welcome-start">开始检查作品</button></div>').querySelector('#welcome-start').onclick=event=>event.target.closest('dialog').close();
+   else if(role==='student')await maybePromptLegacyMigration();
   }catch(e){if(form.isConnected)error.textContent=e.message||'暂时无法进入，请稍后重试。';else toast(e.message);}
   finally{button.disabled=false;}
  };
 }
-function leaveSession(){
+function leaveSession({revoke=true}={}){
+ if(revoke)void state.cloud?.logout().catch(()=>{});
+ try{sessionStorage.removeItem(migrationPromptKey());}catch{}
  clearEntrySession();state.entryRole=null;loadSerial++;
  for(const d of document.querySelectorAll('dialog'))d.close();
  state.viewer?.destroy();state.viewer=null;if(state.video){state.video.pause();URL.revokeObjectURL(state.video.src);state.video=null;}
- state.selected=null;state.files=[];state.versions=[];state.comments=[];state.version=null;state.assets=[];assetPreviews.clear();renderAccess();
+ state.selected=null;state.files=[];state.versions=[];state.comments=[];state.version=null;state.assets=[];state.role=null;state.assetsReady=false;state.legacyAssets=[];assetPreviews.clear();renderAccess();
 }
 function readMarkup(asset){
  if(asset.demo)return '';
- const preview=assetPreviews.get(previewKey(asset)),latest=preview?.versionId;
+ const preview=assetPreviews.get(previewKey(asset)),latest=asset.latest_version_id||preview?.versionId;
  const read=Boolean(latest&&asset.teacher_read_version_id===latest);
  return '<span class="read-badge '+(read?'read':'unread')+'">'+(read?'老师已读':'老师未读')+'</span>';
 }
@@ -96,7 +104,7 @@ async function markTeacherRead(asset,version){
  requireTeacher();
  if(asset.teacher_read_version_id===version.id)return;
  try{
-  const saved=state.mode==='local'?await db.markRead(asset.id,version.id):!state.token&&state.mode==='cloud'?await state.cloud.markRead(asset.id,version.id):null;
+  const saved=await state.cloud.markRead(asset.id,version.id);
   if(!saved)return;
   Object.assign(asset,saved);updateReadBadges(asset);
  }catch(error){toast('作品已打开，但已读状态未能保存：'+error.message);}
@@ -106,7 +114,7 @@ async function changeReviewStatus(asset,status){
  if(state.token)throw Error('此链接暂只支持预览与评语。同步检查状态需要老师的共享账户。');
  const version=state.selected?.id===asset.id?state.version:null;
  if(!version||version.id!==state.versions[0]?.id)throw Error('请打开最新版本后设置检查状态。');
- const saved=state.mode==='cloud'?await state.cloud.reviewAsset(asset.id,status,version.id):await db.setReviewStatus(asset.id,status,version.id);
+ const saved=await state.cloud.reviewAsset(asset.id,status,version.id);
  Object.assign(asset,saved);render();
  for(const dialog of document.querySelectorAll('.detail-dialog'))if(state.selected?.id===asset.id){const badge=dialog.querySelector('.viewer-toolbar > .badge');if(badge){badge.className='badge '+asset.status;badge.textContent=STATUS[asset.status];}}
 }
@@ -114,15 +122,15 @@ function deleteAsset(asset,detail){
  requireStudent();
  const d=dialog('删除作品','<p>“'+esc(asset.title)+'”将移入回收站，原始文件和版本仍会保留，可以恢复。</p><div class="form-actions"><button class="button ghost" id="cancel-delete">取消</button><button class="button danger" id="confirm-delete">移入回收站</button></div>');
  d.querySelector('#cancel-delete').onclick=()=>d.close();
- d.querySelector('#confirm-delete').onclick=run(async event=>{requireStudent();event.target.disabled=true;try{if(state.mode==='cloud')await state.cloud.softDeleteAsset(asset.id);else await db.softDeleteAsset(asset.id);d.close();detail.close();state.mode=state.mode==='local'?'empty':state.mode;await refresh();toast('作品已移入回收站。');}finally{event.target.disabled=false;}});
+ d.querySelector('#confirm-delete').onclick=run(async event=>{requireStudent();event.target.disabled=true;try{await state.cloud.softDeleteAsset(asset.id);d.close();detail.close();state.mode=state.mode==='local'?'empty':state.mode;await refresh();toast('作品已移入回收站。');}finally{event.target.disabled=false;}});
 }
 async function recycleBin(){
  requireStudent();
- const rows=state.mode==='cloud'?await state.cloud.listDeletedAssets():await db.getDeletedAssets();
+ const rows=await state.cloud.listDeletedAssets();
  const d=dialog('回收站','<p class="help-text">删除的作品与原始版本保留在这里。</p>'+(rows.length?rows.map(asset=>'<div class="material-row"><div><strong>'+esc(asset.title)+'</strong><small>'+CATS[asset.category]+' · '+date(asset.deleted_at)+'</small></div><button class="button ghost small" data-restore="'+esc(asset.id)+'">恢复作品</button></div>').join(''):'<div class="empty-state"><p>回收站是空的。</p></div>'));
- d.querySelectorAll('[data-restore]').forEach(button=>button.onclick=run(async()=>{requireStudent();button.disabled=true;try{if(state.mode==='cloud')await state.cloud.restoreAsset(button.dataset.restore);else await db.restoreAsset(button.dataset.restore);d.close();await refresh();toast('作品已恢复。');}finally{button.disabled=false;}}));
+ d.querySelectorAll('[data-restore]').forEach(button=>button.onclick=run(async()=>{requireStudent();button.disabled=true;try{await state.cloud.restoreAsset(button.dataset.restore);d.close();await refresh();toast('作品已恢复。');}finally{button.disabled=false;}}));
 }
-function previewSource(){return {local:!state.token&&state.mode!=='cloud',cloud:state.cloud,versions:state.token?state.shared?.versions:null,scope:!state.token&&state.mode!=='cloud'?'local':'cloud:'+state.config.supabaseUrl};}
+function previewSource(){return {local:false,cloud:state.cloud,versions:null,scope:'cloud:'+(state.config.apiUrl||state.config.supabaseUrl)};}
 function previewKey(asset,source=previewSource()){return source.scope+'|'+asset.id+'|'+(asset.updated_at||asset.created_at||'');}
 function previewMarkup(asset){
  if(asset.demo)return postalArt(asset.category);
@@ -145,13 +153,13 @@ async function ensureAssetPreview(asset){
  if(assetPreviews.get(key)!==pending)return;
  if(previewKey(asset)!==key){assetPreviews.delete(key);return;}
  try{
-  const versions=source.versions?source.versions.filter(v=>v.asset_id===asset.id):source.local?await db.getVersions(asset.id):await source.cloud.listVersions(asset.id);
+  const versions=await source.cloud.listVersions(asset.id);
   const version=[...versions].sort((a,b)=>b.number-a.number)[0];
   if(!version){pending.empty=true;return;}
   pending.versionId=version.id;
   let thumbnail=validPreview(version.stats?.thumbnail)&&(asset.category==='vfx'||version.stats?.previewRevision===PREVIEW_REVISION)?version.stats.thumbnail:await readPreview(source.scope,version.id);
   if(!thumbnail){
-   const files=source.local?await db.getFiles(version.id):await source.cloud.downloadVersion(version);
+   const files=await source.cloud.downloadVersion(version);
    if(!files.length||files.every(file=>!file.size)){pending.empty=true;return;}
    thumbnail=(await generateMediaThumbnail(files,asset.category)).thumbnail;
    await writePreview(source.scope,version.id,thumbnail);
@@ -175,9 +183,9 @@ function render(){
  if(!state.entryRole){renderAccess();return;}
  if(readEntrySession()!==state.entryRole){leaveSession();return;}
  const rows=currentAssets(),filtered=rows.filter(a=>(state.category==='all'||a.category===state.category)&&(state.status==='all'||a.status===state.status)&&(a.title+' '+a.description).toLowerCase().includes(state.query.toLowerCase()));
- const mode=state.token?'老师评审':state.demo?'演示预览':state.mode==='cloud'?'共享评审':'本机草稿 · 未同步';
- app.innerHTML='<div class="app-shell"><aside class="sidebar"><a class="brand" href="./"><span class="brand-icon">'+ico('mail')+'</span><span>栖息邮局<small>毕业设计 · 评审工作台</small></span></a><div class="sidebar-note">作品目录 <span>WORKSPACE</span></div><nav class="nav-list" aria-label="作品分类">'+Object.entries(CATS).map(([k,v])=>'<button class="nav-item '+(state.category===k?'active':'')+'" data-category="'+k+'">'+ico(k==='all'?'grid':k)+'<span class="nav-label">'+v+'</span><span class="nav-count">'+rows.filter(a=>k==='all'||a.category===k).length+'</span></button>').join('')+'</nav><div class="sidebar-bottom"><div class="sidebar-note">让每一次反馈<br>成为下一步的方向。</div><button class="nav-item" id="help">'+ico('chat')+'<span>使用与检查说明</span></button><button class="nav-item" id="settings">'+ico('settings')+'<span>连接与账户</span></button><a class="nav-item" href="https://github.com/YinXiangs/BiShe_Mesh_DongHua_TeXiao" target="_blank" rel="noreferrer">'+ico('link')+'<span>项目 GitHub 仓库</span></a></div></aside><main class="main"><header class="topbar"><div class="breadcrumb">毕业设计 <span>/</span> '+esc(CATS[state.category])+'</div><div class="top-actions session-actions"><span class="identity-chip">'+(state.entryRole==='teacher'?'教师端':'学生端')+'</span><span class="mode-pill">'+mode+'</span><button class="button ghost small" id="leave-session">退出登录</button>'+(state.token?'':'<button class="button ghost small" id="mode-toggle">'+(state.demo?'进入我的作品':state.mode==='cloud'?'切到本机草稿':'共享评审')+'</button>')+'</div></header><section class="hero"><div class="hero-copy"><div class="eyebrow">QIXI POST OFFICE · GRADUATION PROJECT</div><h1>把每一份用心，<br>寄往下一次进步。</h1><p>《栖息邮局》作品提交与指导记录<br>模型、动画与特效，在这里有序生长。</p><div class="hero-actions">'+(!canEdit()?'<span class="help-text">打开作品即可查看版本、检查模型并留下意见。</span>':'<button class="button primary" id="new-asset">'+ico('plus')+' 新增作品</button><button class="button ghost" id="share-project">'+ico('link')+' 邀请老师评审</button>')+'</div></div><div class="hero-art">'+postalArt('scene')+'<span class="hero-stamp">用心制作 · 持续生长</span></div></section><section class="stats-grid" aria-label="项目概览">'+[['grid','作品总数',rows.length],['clock','待老师检查',rows.filter(a=>a.status==='review').length],['chat','需要修改',rows.filter(a=>a.status==='changes').length],['check','检查已通过',rows.filter(a=>a.status==='approved').length]].map(([i,t,n])=>'<div class="stat-card"><span class="stat-icon">'+ico(i)+'</span><div><div class="stat-value">'+n+'<small> 件</small></div><div class="stat-label">'+t+'</div></div></div>').join('')+'</section>'+
- (state.accessError?'<div class="notice" role="alert">'+ico('link')+'<span><strong>暂时无法打开评审链接</strong><br>'+esc(state.accessError)+'</span><button class="button ghost small" id="retry-access">重试</button></div>':state.demo?'<div class="notice">'+ico('grid')+'<span>当前为演示作品，帮助你体验检查功能。新增作品后会显示你的真实提交。</span></div>':state.mode==='local'?'<div class="notice">'+ico('clock')+'<span><strong>本机草稿 · 尚未同步</strong><br>模型、已通过状态和留言只保存在这台设备。老师的手机和你的电脑暂时无法共享；请在作品里导出评审记录备份。</span></div>':state.token?'<div class="notice">'+ico('link')+'<span>专属评审链接 · 有效至 '+esc(state.shared?.expires_at?date(state.shared.expires_at):'尚未读取')+'。访客姓名由填写者提供。</span></div>':'')+
+ const mode='共享评审';
+ app.innerHTML='<div class="app-shell"><aside class="sidebar"><a class="brand" href="./"><span class="brand-icon">'+ico('mail')+'</span><span>栖息邮局<small>毕业设计 · 评审工作台</small></span></a><div class="sidebar-note">作品目录 <span>WORKSPACE</span></div><nav class="nav-list" aria-label="作品分类">'+Object.entries(CATS).map(([k,v])=>'<button class="nav-item '+(state.category===k?'active':'')+'" data-category="'+k+'">'+ico(k==='all'?'grid':k)+'<span class="nav-label">'+v+'</span><span class="nav-count">'+rows.filter(a=>k==='all'||a.category===k).length+'</span></button>').join('')+'</nav><div class="sidebar-bottom"><div class="sidebar-note">让每一次反馈<br>成为下一步的方向。</div><button class="nav-item" id="help">'+ico('chat')+'<span>使用与检查说明</span></button><button class="nav-item" id="settings">'+ico('settings')+'<span>连接与账户</span></button><a class="nav-item" href="https://github.com/YinXiangs/BiShe_Mesh_DongHua_TeXiao" target="_blank" rel="noreferrer">'+ico('link')+'<span>项目 GitHub 仓库</span></a></div></aside><main class="main"><header class="topbar"><div class="breadcrumb">毕业设计 <span>/</span> '+esc(CATS[state.category])+'</div><div class="top-actions session-actions"><span class="identity-chip">'+(state.entryRole==='teacher'?'教师端':'学生端')+'</span><span class="mode-pill">'+mode+'</span><button class="button ghost small" id="leave-session">退出登录</button>'+'</div></header><section class="hero"><div class="hero-copy"><div class="eyebrow">QIXI POST OFFICE · GRADUATION PROJECT</div><h1>把每一份用心，<br>寄往下一次进步。</h1><p>《栖息邮局》作品提交与指导记录<br>模型、动画与特效，在这里有序生长。</p><div class="hero-actions">'+(!canEdit()?'<span class="help-text">打开作品即可查看版本、检查模型并留下意见。</span>':'<button class="button primary" id="new-asset">'+ico('plus')+' 新增作品</button><button class="button ghost" id="share-project">'+ico('link')+' 邀请老师评审</button>')+'</div></div><div class="hero-art">'+postalArt('scene')+'<span class="hero-stamp">用心制作 · 持续生长</span></div></section><section class="stats-grid" aria-label="项目概览">'+[['grid','作品总数',rows.length],['clock','待老师检查',rows.filter(a=>a.status==='review').length],['chat','需要修改',rows.filter(a=>a.status==='changes').length],['check','检查已通过',rows.filter(a=>a.status==='approved').length]].map(([i,t,n])=>'<div class="stat-card"><span class="stat-icon">'+ico(i)+'</span><div><div class="stat-value">'+n+'<small> 件</small></div><div class="stat-label">'+t+'</div></div></div>').join('')+'</section>'+
+ (state.accessError?'<div class="notice" role="alert">'+ico('link')+'<span><strong>共享服务暂时无法连接</strong><br>'+esc(state.accessError)+'</span><button class="button ghost small" id="retry-access">重试</button></div>':'')+
  '<section><div class="section-head"><div><h2>'+esc(CATS[state.category])+' <span class="help-text">/ '+filtered.length+' 件</span></h2><p>每一项作品，都有独立的版本与反馈记录。</p></div><label class="search-field">'+ico('search')+'<input id="search" type="search" aria-label="搜索作品" placeholder="搜索作品名称…" value="'+esc(state.query)+'"></label></div><div class="filters">'+[['all','全部状态'],...Object.entries(STATUS)].map(([k,v])=>'<button class="filter-chip '+(state.status===k?'active':'')+'" data-status="'+k+'">'+v+'</button>').join('')+'</div><div class="asset-grid">'+filtered.map(a=>'<article class="asset-card"><button class="asset-thumb" data-open="'+esc(a.id)+'" aria-label="检查'+esc(a.title)+'">'+'<span class="asset-preview">'+previewMarkup(a)+'</span>'+'<span class="asset-category">'+CATS[a.category]+'</span>'+(a.demo?'<span class="badge demo">演示</span>':'')+'</button><div class="asset-body"><div class="asset-meta"><span>'+((a.category==='vfx')?'MP4 · 特效视频':'FBX · '+(a.category==='animation'?'动画文件':'三维模型'))+'</span><span class="badge '+a.status+'">'+STATUS[a.status]+'</span></div><div class="asset-read" data-read>'+readMarkup(a)+'</div><h3 class="asset-title">'+esc(a.title)+'</h3><p class="asset-description">'+esc(a.description||'等待补充制作说明')+'</p><div class="asset-footer"><span>'+ (a.demo?'示例预览':'更新于 '+date(a.updated_at||a.created_at))+'</span><button class="button ghost small" data-open="'+esc(a.id)+'">进入检查 '+ico('arrow')+'</button></div></div></article>').join('')+'</div>'+(!filtered.length?'<div class="empty-state">'+ico('mail')+'<h3>这里还没有作品</h3><p>学生提交作品后，即可在这里预览与检查。</p>'+(canEdit()?'<button class="button primary" id="empty-add">新增第一件作品</button>':'')+'</div>':'')+'</section><footer class="page-footer">栖息邮局 · 毕业设计评审工作台 <span>每次提交，离完成更近一步。</span></footer></main></div>';
  app.querySelectorAll('[data-category]').forEach(b=>b.onclick=()=>{state.category=b.dataset.category;render();});
  app.querySelectorAll('[data-status]').forEach(b=>b.onclick=()=>{state.status=b.dataset.status;render();});
@@ -188,11 +196,23 @@ function render(){
  if(canEdit()){const trash=document.createElement('button');trash.className='nav-item';trash.id='recycle-bin';trash.innerHTML=ico('grid')+'<span>回收站</span>';app.querySelector('.sidebar-bottom').prepend(trash);}
  if(state.token)app.querySelector('#settings').hidden=true;
  app.querySelector('#help').onclick=help;
- app.querySelector('#mode-toggle')?.addEventListener('click',run(async()=>{if(state.demo){state.demo=false;state.mode='empty';await refresh();}else if(state.mode==='cloud'){state.mode='local';await refresh();}else if(state.cloud){state.mode='cloud';await refresh();if(!state.role)settings();}else settings();}));
  app.querySelector('#share-project')?.addEventListener('click',run(()=>share()));
  app.querySelector('#retry-access')?.addEventListener('click',run(refresh));
  app.querySelector('#leave-session')?.addEventListener('click',leaveSession);
  app.querySelector('#recycle-bin')?.addEventListener('click',run(recycleBin));
+ // Shared mode is the only submission destination. Old browser data is read solely by migration.
+ app.querySelector('#settings')?.remove();
+ const refreshButton=document.createElement('button');refreshButton.className='button ghost small';refreshButton.id='refresh-project';refreshButton.textContent='刷新作品';
+ refreshButton.onclick=run(async()=>{refreshButton.disabled=true;try{await refresh();}finally{refreshButton.disabled=false;}});
+ app.querySelector('#leave-session').before(refreshButton);
+ if(state.accessError){
+   const notice=app.querySelector('.notice');if(notice?.querySelector('strong'))notice.querySelector('strong').textContent='共享服务暂时无法连接';
+   if(!state.assetsReady){app.querySelector('.stats-grid')?.remove();app.querySelector('.asset-grid')?.remove();app.querySelector('.empty-state')?.remove();app.querySelectorAll('.nav-count').forEach(node=>node.textContent='—');const count=app.querySelector('.section-head h2 .help-text');if(count)count.textContent='/ 暂时无法读取';}
+ }
+ if(canEdit()&&state.legacyAssets.length){
+   const notice=document.createElement('div');notice.className='notice migration-notice';notice.innerHTML=ico('upload')+'<span><strong>发现这台设备上的 '+state.legacyAssets.length+' 件旧作品</strong><br>迁移到共享评审后，老师的手机和你的电脑都能查看。原记录会继续保留。</span><button class="button primary small" id="migrate-legacy">迁移这台设备上的旧作品</button>';
+   app.querySelector('.hero').after(notice);notice.querySelector('button').onclick=run(migrateLegacy);
+ }
  observeAssetPreviews();
 }
 function dialog(title,body,wide=false){
@@ -203,17 +223,17 @@ function newAsset(){
  requireStudent();
  if(state.mode==='cloud'&&state.role!=='owner'){settings();return;}if(state.token)return;
  const d=dialog('新增作品','<form id="asset-form" class="form-grid"><label class="field">作品名称<input name="title" required maxlength="80" placeholder="例如：邮局主建筑"></label><label class="field">作品分类<select name="category">'+Object.entries(CATS).filter(([k])=>k!=='all').map(([k,v])=>'<option value="'+k+'" '+(state.category===k?'selected':'')+'>'+v+'</option>').join('')+'</select></label><label class="field">制作说明<textarea name="description" maxlength="3000" placeholder="写下本次想请老师重点检查的内容。"></textarea></label><p class="help-text">新增后可提交 FBX 模型／动画，或 MP4 特效视频。每类作品数量不限。</p><div class="form-actions"><button class="button primary">创建作品</button></div></form>');
- d.querySelector('form').onsubmit=run(async e=>{e.preventDefault();requireStudent();const f=new FormData(e.target),title=f.get('title').trim();if(!title)throw Error('请填写作品名称。');const a={id:uid(),title,category:f.get('category'),description:f.get('description').trim(),status:'pending',created_at:new Date().toISOString(),updated_at:new Date().toISOString()};if(state.mode==='cloud')await state.cloud.createAsset(a);else await db.putAsset(a);state.demo=false;state.category=a.category;state.status='all';state.query='';d.close();await refresh();await openAsset(a.id);toast('作品已创建，可以提交第一个版本。');});
+ d.querySelector('form').onsubmit=run(async e=>{e.preventDefault();requireStudent();const f=new FormData(e.target),title=f.get('title').trim();if(!title)throw Error('请填写作品名称。');const a={id:uid(),title,category:f.get('category'),description:f.get('description').trim(),status:'pending',created_at:new Date().toISOString(),updated_at:new Date().toISOString()};await state.cloud.createAsset(a);state.demo=false;state.category=a.category;state.status='all';state.query='';d.close();await refresh();await openAsset(a.id);toast('作品已创建，可以提交第一个版本。');});
 }
 async function openAsset(id){
  if(!state.entryRole){renderAccess();return;}
  if(state.token){await refresh();if(state.accessError)return;}
  state.selected=currentAssets().find(a=>a.id===id);const a=state.selected;if(!a)return;
- state.versions=a.demo?[{id:'demo-version',number:1,filename:a.category==='vfx'?'等待提交.mp4':'演示几何体',created_at:new Date().toISOString()}]:state.token?state.shared.versions.filter(v=>v.asset_id===id).sort((a,b)=>b.number-a.number):state.mode==='cloud'?await state.cloud.listVersions(id):await db.getVersions(id);
- state.comments=a.demo?[]:state.token?state.shared.comments.filter(c=>c.asset_id===id):state.mode==='cloud'?await state.cloud.listComments(id):await db.getComments(id);
+ state.versions=await state.cloud.listVersions(id);
+ state.comments=await state.cloud.listComments(id);
  const d=dialog(a.title,'<div class="detail-layout"><section class="viewer-column"><div class="viewer-toolbar"><span class="badge '+a.status+'">'+STATUS[a.status]+'</span><div class="viewer-tools">'+(canEdit()&&!a.demo?'<button class="button primary small" id="upload-version">'+ico('upload')+' 提交新版本</button>':'')+'<button class="button ghost small" id="download-version">下载版本</button><button class="button ghost small" id="asset-share">评审链接</button></div></div><div class="viewer-shell"><div id="model-host" style="width:100%;height:100%;min-height:360px"></div><div class="viewer-overlay" id="view-label">'+(a.demo?'演示预览 · 非提交文件':'')+'</div></div><div id="view-controls"></div><div class="viewer-stats" id="model-stats"></div><div class="inspector-tabs" role="tablist"><button class="filter-chip active" data-tab="summary">检查说明</button><button class="filter-chip" data-tab="materials">材质</button><button class="filter-chip" data-tab="structure">结构</button></div><div class="inspector-panel" id="inspector"></div></section><aside class="review-column"><div class="review-header"><h3>版本与反馈</h3><p>'+esc(a.description||'从整体到细节，记录每一次进步。')+'</p><label class="field">当前检查版本<select id="versions">'+(state.versions.length?state.versions.map(v=>'<option value="'+esc(v.id)+'">V'+v.number+' · '+esc(v.filename)+'</option>').join(''):'<option>尚未提交</option>')+'</select></label>'+(canReview()&&!state.token&&!a.demo?'<label class="field">检查状态<select id="asset-status" class="review-status-select">'+Object.entries(STATUS).filter(([k])=>k!=='pending').map(([k,v])=>'<option value="'+k+'" '+(a.status===k?'selected':'')+'>'+v+'</option>').join('')+'</select></label>':'')+'</div><div class="comment-list" id="comments"></div><form class="comment-form" id="comment-form"><h4>留下检查意见</h4><label class="field">你的称呼<input name="author" required maxlength="40" placeholder="例如：张老师" autocomplete="name" value="'+esc(state.entryRole==='teacher'?'黄静妮教授':localStorage.getItem('qixi-author')||'')+'"></label><div class="form-grid" style="grid-template-columns:1fr 1fr"><label class="field">检查维度<select name="dimension">'+Object.entries(DIM).map(([k,v])=>'<option value="'+k+'">'+v+'</option>').join('')+'</select></label><label class="field">建议<select name="verdict"><option value="note">一般建议</option><option value="changes">建议修改</option><option value="approved">建议通过</option></select></label></div><label class="field">意见内容<textarea name="body" required maxlength="3000" placeholder="可以描述具体位置、问题与修改方向…"></textarea></label><p class="help-text">'+(state.token?'评语会保存到共享评审中。':state.mode==='cloud'?'意见将保存到共享评审。':'本机意见只保存在这台设备，不会自动发送到其他手机或电脑。')+' 记录当前版本及查看位置。</p><button class="button primary" '+(a.demo||!state.versions.length?'disabled':'')+'>提交意见 '+ico('arrow')+'</button></form></aside></div>',true);
  const feedbackTools=document.createElement('div');feedbackTools.className='feedback-actions';feedbackTools.innerHTML='<button class="button ghost small" type="button" id="refresh-feedback">刷新反馈</button><button class="button ghost small" type="button" id="export-feedback">导出评审记录</button>';
- const storageNote=document.createElement('p');storageNote.className='feedback-storage';storageNote.textContent=state.mode==='cloud'||state.token?'共享评审：可刷新最新反馈；导出记录可另行保存。':'尚未同步：通过状态和留言只保存在这台设备。更换设备不会自动出现。';
+ const storageNote=document.createElement('p');storageNote.className='feedback-storage';storageNote.textContent='共享评审：作品、已读、检查状态与意见在手机和电脑间共享。';
  if(!a.demo){d.querySelector('.review-header').append(storageNote,feedbackTools);feedbackTools.querySelector('#export-feedback').onclick=run(()=>exportReviewRecords(a));feedbackTools.querySelector('#refresh-feedback').onclick=run(event=>refreshFeedback(d,a,event.target));}
  d.querySelector('#versions').onchange=run(()=>loadVersion(d,d.querySelector('#versions').value));
  d.querySelector('#upload-version')?.addEventListener('click',()=>upload(d));
@@ -222,9 +242,9 @@ async function openAsset(id){
  d.querySelector('#comment-form').hidden=!canReview();
  if(canEdit()&&!a.demo){const remove=document.createElement('button');remove.className='button danger small';remove.textContent='删除作品';remove.onclick=()=>deleteAsset(a,d);d.querySelector('.viewer-tools').prepend(remove);const edit=document.createElement('button');edit.className='button ghost small';edit.textContent='编辑说明';edit.onclick=()=>editAsset(a,d);d.querySelector('.viewer-tools').prepend(edit);}
  d.querySelector('#download-version').onclick=run(downloadVersion);
- d.querySelector('#asset-status')?.addEventListener('change',run(async e=>{const select=e.target,previous=a.status;select.disabled=true;feedbackWrites++;feedbackMutationSerial++;try{await changeReviewStatus(a,select.value);toast(state.mode==='cloud'?'检查状态已保存到共享评审。':'检查状态只保存在本设备，尚未同步到其他手机或电脑。');}catch(error){select.value=previous;throw error;}finally{feedbackWrites--;feedbackMutationSerial++;select.disabled=Boolean(!canReview()||!state.version||state.version.id!==state.versions[0]?.id);}}));
+ d.querySelector('#asset-status')?.addEventListener('change',run(async e=>{const select=e.target,previous=a.status;select.disabled=true;feedbackWrites++;feedbackMutationSerial++;try{await changeReviewStatus(a,select.value);toast('检查状态已保存到共享评审。');}catch(error){select.value=previous;throw error;}finally{feedbackWrites--;feedbackMutationSerial++;select.disabled=Boolean(!canReview()||!state.version||state.version.id!==state.versions[0]?.id);}}));
  d.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{d.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));inspector(d,b.dataset.tab);});
- d.querySelector('#comment-form').onsubmit=run(async e=>{e.preventDefault();requireTeacher();if(!state.version||a.demo)return;const button=e.target.querySelector('button');button.disabled=true;feedbackWrites++;feedbackMutationSerial++;try{const f=new FormData(e.target),rawBody=f.get('body'),author=f.get('author').trim(),body=rawBody.trim();if(!author||!body)throw Error('请填写称呼与意见内容。');const c={id:uid(),asset_id:a.id,version_id:state.version.id,author_name:author,body,dimension:f.get('dimension'),verdict:f.get('verdict'),context:state.video?{time:state.video.currentTime}:state.viewer?.context()||{},created_at:new Date().toISOString()};let saved=c;if(state.token){saved=await state.cloud.addSharedComment(state.token,c);state.shared?.comments.push(saved);}else if(state.mode==='cloud'){saved=await state.cloud.addComment(c);}else await db.putComment(c);if(state.selected?.id===a.id&&!state.comments.some(row=>row.id===saved.id))state.comments.push(saved);try{localStorage.setItem('qixi-author',author);}catch{}if(state.version?.id===c.version_id&&e.target.elements.body.value===rawBody)e.target.elements.body.value='';if(d.isConnected)comments(d);toast(state.mode==='cloud'||state.token?'意见已保存到共享评审。':'意见只保存在本设备，尚未同步；可导出评审记录备份。');}finally{feedbackWrites--;feedbackMutationSerial++;button.disabled=Boolean(!canReview()||state.selected?.demo||!state.version);}});
+ d.querySelector('#comment-form').onsubmit=run(async e=>{e.preventDefault();requireTeacher();if(!state.version||a.demo)return;const button=e.target.querySelector('button');button.disabled=true;feedbackWrites++;feedbackMutationSerial++;try{const f=new FormData(e.target),rawBody=f.get('body'),author=f.get('author').trim(),body=rawBody.trim();if(!author||!body)throw Error('请填写称呼与意见内容。');const c={id:uid(),asset_id:a.id,version_id:state.version.id,author_name:author,body,dimension:f.get('dimension'),verdict:f.get('verdict'),context:state.video?{time:state.video.currentTime}:state.viewer?.context()||{},created_at:new Date().toISOString()};const saved=await state.cloud.addComment(c);if(state.selected?.id===a.id&&!state.comments.some(row=>row.id===saved.id))state.comments.push(saved);try{localStorage.setItem('qixi-author',author);}catch{}if(state.version?.id===c.version_id&&e.target.elements.body.value===rawBody)e.target.elements.body.value='';if(d.isConnected)comments(d);toast('意见已保存到共享评审。');}finally{feedbackWrites--;feedbackMutationSerial++;button.disabled=Boolean(!canReview()||state.selected?.demo||!state.version);}});
  await loadVersion(d,state.versions[0]?.id);comments(d);
 }
 async function loadVersion(d,id){
@@ -239,7 +259,7 @@ async function loadVersion(d,id){
  if(state.versions.length)d.querySelectorAll('#versions option').forEach(o=>{if(!state.versions.some(v=>v.id===o.value))o.remove();});
  if(!state.version){host.innerHTML='<div class="viewer-empty">'+ico('upload')+'<h3>提交第一版作品</h3><p>模型与动画使用 FBX，特效使用 MP4。贴图请与 FBX 一起选择。</p></div>';inspector(d);comments(d);return;}
  host.innerHTML='<div class="viewer-empty">正在读取文件…</div>';
- const files=state.selected.demo?[]:state.mode==='cloud'||state.token?await state.cloud.downloadVersion(state.version):await db.getFiles(id);
+ const files=await state.cloud.downloadVersion(state.version);
  if(!d.isConnected||request!==loadSerial)return;state.files=files;host.innerHTML='';
  if(state.selected.category==='vfx'){
    if(state.selected.demo){host.innerHTML='<div class="viewer-empty">'+ico('vfx')+'<h3>MP4 特效检查区</h3><p>提交视频后，可播放、拖动进度并按时间点记录意见。</p></div>';}
@@ -275,8 +295,9 @@ function comments(d){const list=d.querySelector('#comments');if(!list)return;con
 }
 function upload(detail){
  requireStudent();
+ let pendingVersion=null;
  const a=state.selected,d=dialog('提交新版本 · '+a.title,'<form class="form-grid"><label class="upload-zone">'+ico('upload')+'<strong>选择 '+(a.category==='vfx'?'MP4 视频':'FBX 与全部贴图')+'</strong><span>支持多选；每个版本保留原始文件</span><input name="files" type="file" multiple required accept="'+(a.category==='vfx'?'.mp4':'.fbx,.png,.jpg,.jpeg,.webp,.tga,.bmp,.gif')+'"></label><div class="file-list"></div><p class="help-text">单文件上限 200 MB，每次总计 300 MB。'+(state.mode==='cloud'?'云存储还受服务端配额与存储桶限制。':'当前提交仅保存在本机浏览器；请及时下载备份。')+'</p><div class="form-actions"><button class="button primary">保存并预览</button></div></form>');
- d.querySelector('input').onchange=e=>d.querySelector('.file-list').textContent=[...e.target.files].map(f=>f.name+' · '+size(f.size)).join('\n');
+ d.querySelector('input').onchange=e=>{pendingVersion=null;d.querySelector('.file-list').textContent=[...e.target.files].map(f=>f.name+' · '+size(f.size)).join('\n');};
  d.querySelector('form').onsubmit=run(async e=>{
   e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;button.textContent='正在保存…';
   try{
@@ -286,13 +307,14 @@ function upload(detail){
     button.textContent='正在生成预览…';
     try{preview=await generateMediaThumbnail(files,a.category);}catch(error){previewError=error.message;}
     button.textContent='正在保存…';
-    let version={id:uid(),asset_id:a.id,number:Math.max(0,...state.versions.map(x=>x.number))+1,filename:v.mainFile.name,stats:preview?{...preview.stats,thumbnail:preview.thumbnail,thumbnail_revision:2}:{},created_at:new Date().toISOString()};
-    requireStudent();if(cloudMode)version=await state.cloud.uploadVersion(a.id,version,files);else await db.putVersion(version,files);
+    pendingVersion ||= {id:uid(),asset_id:a.id,number:Math.max(0,...state.versions.map(x=>x.number))+1,filename:v.mainFile.name,stats:preview?{...preview.stats,thumbnail:preview.thumbnail,thumbnail_revision:2}:{},created_at:new Date().toISOString()};
+    let version=pendingVersion;
+    requireStudent();version=await state.cloud.uploadVersion(a.id,version,files,({sent,total})=>{button.textContent='正在上传 '+Math.round(sent/total*100)+'%…';});
     // The version is committed. Later status/preview errors must not invite a duplicate upload.
     if(state.selected?.id===a.id)state.versions.unshift(version);
     let warning=previewError?'版本已保存，文件暂时无法生成预览；可打开作品查看详情。':'';
     const changed={...a,status:'review',teacher_read_version_id:null,teacher_read_at:null,updated_at:new Date().toISOString()};
-    try{const saved=cloudMode?await state.cloud.saveAsset(changed):(await db.getAssets({includeDeleted:true})).find(row=>row.id===a.id);Object.assign(a,saved||changed);}
+    try{const saved=await state.cloud.saveAsset(changed);Object.assign(a,saved||changed);}
     catch{warning='版本已保存，作品进度未能更新，请稍后重新设置进度。';}
     assetPreviews.set(previewKey(a,source),preview?{versionId:version.id,thumbnail:preview.thumbnail}:{versionId:version.id,error:previewError});
     if(preview)void writePreview(source.scope,version.id,preview.thumbnail);
@@ -303,14 +325,98 @@ function upload(detail){
       const statusSelect=detail.querySelector('#asset-status');if(statusSelect)statusSelect.value=a.status;
       try{await loadVersion(detail,version.id);}catch{warning=warning||'版本已保存，预览暂时无法读取；请重新打开此作品。';}
     }
-    toast(warning||(cloudMode?'版本已提交到共享评审。':'版本已保存到当前浏览器。'));
+    toast(warning||'版本已提交到共享评审。');
   }finally{if(d.isConnected){button.disabled=false;button.textContent='保存并预览';}}
  });
 }
 function editAsset(a,detail){
  requireStudent();
  const d=dialog('编辑作品说明','<form class="form-grid"><label class="field">作品名称<input name="title" required maxlength="80" value="'+esc(a.title)+'"></label><label class="field">制作说明<textarea name="description" maxlength="3000">'+esc(a.description)+'</textarea></label><div class="form-actions"><button class="button primary">保存说明</button></div></form>');
- d.querySelector('form').onsubmit=run(async e=>{e.preventDefault();requireStudent();const f=new FormData(e.target);const title=f.get('title').trim();if(!title)throw Error('请填写名称。');const metadata={title,description:f.get('description').trim()};const saved=state.mode==='cloud'?await state.cloud.saveAsset({...a,...metadata}):await db.updateAssetMetadata(a.id,metadata);Object.assign(a,saved);d.close();detail.close();await refresh();await openAsset(a.id);toast('作品说明已保存。');});
+ d.querySelector('form').onsubmit=run(async e=>{e.preventDefault();requireStudent();const f=new FormData(e.target);const title=f.get('title').trim();if(!title)throw Error('请填写名称。');const metadata={title,description:f.get('description').trim()};const saved=await state.cloud.saveAsset({...a,...metadata});Object.assign(a,saved);d.close();detail.close();await refresh();await openAsset(a.id);toast('作品说明已保存。');});
+}
+
+const migrationKey=()=> 'qixi-migration-complete-v1:'+(state.config.apiUrl||'');
+const migrationPromptKey=()=> 'qixi-migration-prompt-v1:'+(state.config.apiUrl||'');
+async function maybePromptLegacyMigration(){
+ if(state.entryRole!=='student'||!state.assetsReady||state.accessError||state.assets.length||!state.legacyAssets.length||document.querySelector('dialog'))return;
+ try{if(sessionStorage.getItem(migrationPromptKey())==='1')return;}catch{}
+ // Empty legacy placeholders do not need a migration prompt.
+ let hasVersions=false;for(const asset of state.legacyAssets){if((await db.getVersions(asset.id)).length){hasVersions=true;break;}}
+ if(!hasVersions||state.entryRole!=='student'||state.assets.length)return;
+ try{sessionStorage.setItem(migrationPromptKey(),'1');}catch{}
+ await migrateLegacy();
+}
+function migrationFingerprint(asset,versions,comments){return JSON.stringify([asset.id,versions.map(v=>v.id).sort(),comments.map(c=>c.id).sort(),asset.status,asset.teacher_read_version_id||null]);}
+function migrationMarks(){try{return JSON.parse(localStorage.getItem(migrationKey())||'{}')||{};}catch{return {};}}
+async function findLegacyAssets(){
+ const assets=await db.getAssets(),marks=migrationMarks(),result=[];
+ for(const asset of assets){const [versions,comments]=await Promise.all([db.getVersions(asset.id),db.getComments(asset.id)]);if(marks[asset.id]!==migrationFingerprint(asset,versions,comments))result.push(asset);}
+ return result;
+}
+async function migrateLegacy(){
+ requireStudent();if(state.migrationBusy)throw Error('旧作品正在迁移，请等待当前任务完成。');
+ const assets=await findLegacyAssets();
+ if(!assets.length){await refresh();toast('这台设备没有待迁移的旧作品。');return;}
+ const snapshots=[];
+ for(const asset of assets){const [versions,comments]=await Promise.all([db.getVersions(asset.id),db.getComments(asset.id)]);snapshots.push({asset,versions:[...versions].sort((a,b)=>a.number-b.number),comments});}
+ const hasFeedback=snapshot=>Boolean(snapshot.comments.length||['approved','changes'].includes(snapshot.asset.status)||snapshot.asset.teacher_read_version_id);
+ const feedbackCount=snapshots.filter(hasFeedback).length;
+ const body='<p>将下面的旧作品和全部历史版本保存到共享评审。完成后，老师与学生在其他手机和电脑登录相同网址即可查看。原文件与记录会保留在这台设备。</p><div class="migration-list">'+snapshots.map((snapshot,index)=>'<label class="migration-row"><input type="checkbox" name="migration-asset" value="'+index+'" checked><span><strong>'+esc(snapshot.asset.title)+'</strong><small>'+snapshot.versions.length+' 个版本 · '+snapshot.comments.length+' 条留言 · '+STATUS[snapshot.asset.status]+'</small></span></label>').join('')+'</div>'+(feedbackCount?'<label class="migration-option"><input type="checkbox" id="migrate-review">同时迁移老师反馈（'+feedbackCount+' 件作品有检查记录）</label><label class="field" id="migration-teacher-field" hidden>教师访问密码<input id="migration-teacher-code" type="password" autocomplete="off" maxlength="64" placeholder="由老师确认后输入"></label><p class="help-text">老师反馈需要教师身份确认。未勾选时仅迁移作品文件，原有留言与检查结果仍保留在这台设备；已有云端检查结果不会被旧记录覆盖。</p>':'')+'<p class="help-text">支持中断后重试，已完成的版本会跳过。上传期间请保持此页面打开。</p><div class="migration-progress" role="status" aria-live="polite"></div><div class="migration-results" aria-live="polite"></div><div class="form-actions"><button class="button ghost" id="migration-close">稍后处理</button><button class="button primary" id="migration-start">开始迁移到共享评审</button></div>';
+ const d=dialog('迁移这台设备上的旧作品',body),progress=d.querySelector('.migration-progress'),results=d.querySelector('.migration-results'),start=d.querySelector('#migration-start'),close=d.querySelector('#migration-close');
+ close.onclick=()=>d.close();
+ const reviewOption=d.querySelector('#migrate-review');if(reviewOption)reviewOption.onchange=()=>{const field=d.querySelector('#migration-teacher-field');field.hidden=!reviewOption.checked;if(!reviewOption.checked)field.querySelector('input').value='';};
+ let busy=false;
+ d.addEventListener('cancel',event=>{if(busy)event.preventDefault();});
+ d.addEventListener('click',event=>{if(busy&&event.target===d){event.preventDefault();event.stopImmediatePropagation();}},true);
+ start.onclick=async()=>{
+  if(busy)return;
+  const selected=[...d.querySelectorAll('input[name="migration-asset"]:checked')].map(input=>snapshots[Number(input.value)]);
+  if(!selected.length){progress.textContent='请先勾选要迁移的作品。';return;}
+  let teacherGrant=null,completed=0,failed=0,retained=0;
+  busy=true;state.migrationBusy=true;start.disabled=true;close.disabled=true;d.querySelector('.close-button').disabled=true;
+  d.querySelectorAll('input').forEach(input=>input.disabled=true);results.replaceChildren();
+  try{
+   requireStudent();
+   if(reviewOption?.checked){
+    const input=d.querySelector('#migration-teacher-code'),password=input.value;input.value='';
+    if(!password)throw Error('迁移老师反馈前，请输入教师访问密码确认。');
+    teacherGrant=await state.cloud.loginWithCode(password,{persist:false});
+    if(teacherGrant.role!=='teacher')throw Error('迁移检查意见需要教师访问密码，请由老师确认。');
+   }
+   const remoteAssets=await state.cloud.listAssets(),remoteIds=new Set(remoteAssets.map(asset=>asset.id)),marks=migrationMarks();
+   for(const [index,snapshot] of selected.entries()){
+    const {asset,versions,comments}=snapshot;
+    try{
+     requireStudent();progress.textContent='正在迁移 '+(index+1)+' / '+selected.length+'：'+asset.title;
+     if(!remoteIds.has(asset.id)){
+      try{await state.cloud.createAsset(asset);remoteIds.add(asset.id);}
+      catch(error){if(error.status!==409||!(await state.cloud.listAssets()).some(row=>row.id===asset.id))throw error;remoteIds.add(asset.id);}
+     }
+     const cloudVersions=await state.cloud.listVersions(asset.id),missingVersions=planLegacyVersions(versions,cloudVersions);
+     for(const version of missingVersions){
+      const files=await db.getFiles(version.id);
+      if(!files.length)throw Error('V'+version.number+' 的原始文件无法读取，请保留本机记录并重新提交该版本。');
+      await state.cloud.uploadVersion(asset.id,version,files,({sent,total})=>{progress.textContent='正在迁移 '+asset.title+' · V'+version.number+' · '+Math.round(sent/total*100)+'%';});
+     }
+     // Feedback can only be imported using an independently authenticated teacher session.
+     let preservedCloudReview=false;if(teacherGrant&&hasFeedback(snapshot)){progress.textContent='正在迁移 '+asset.title+' 的老师反馈…';const imported=await state.cloud.importReview(asset.id,{asset,versions:versions.map(({id,number})=>({id,number})),comments},teacherGrant.token);preservedCloudReview=imported.migrationResult?.statusTransferred===false;}
+     const keptFeedback=hasFeedback(snapshot)&&!teacherGrant;
+     if(keptFeedback)retained++;
+     else{marks[asset.id]=migrationFingerprint(asset,versions,comments);try{localStorage.setItem(migrationKey(),JSON.stringify(marks));}catch{/* A lost completion marker only causes a safe idempotent retry. */}}
+     completed++;
+     const row=document.createElement('p');row.className='migration-success';row.textContent=asset.title+'：作品已共享'+(keptFeedback?'；老师反馈仍保留在原设备':preservedCloudReview?'，留言已迁移；云端较新的检查结果已保留':'，记录已迁移');results.append(row);
+    }catch(error){
+     failed++;const row=document.createElement('p');row.className='migration-failure';row.textContent=asset.title+'：'+(error.message||'迁移未完成')+'。原始记录仍保留，可稍后重试。';results.append(row);
+    }
+   }
+   progress.textContent='迁移完成：'+completed+' 件成功'+(failed?'，'+failed+' 件需要重试':'')+(retained?'。其中 '+retained+' 件的老师反馈尚未迁移，可再次勾选“同时迁移老师反馈”处理。':'。');
+   await refresh();
+  }catch(error){progress.textContent=error.message||'迁移未完成，请稍后重试。';}
+  finally{
+   if(teacherGrant)await state.cloud.logoutToken(teacherGrant.token).catch(()=>{});
+   busy=false;state.migrationBusy=false;start.disabled=false;start.textContent='再次迁移 / 重试未完成项';close.disabled=false;close.textContent='关闭';d.querySelector('.close-button').disabled=false;d.querySelectorAll('input').forEach(input=>input.disabled=false);
+  }
+ };
 }
 
 // Only read persisted feedback. A backup never changes reviewer decisions or files.
@@ -318,7 +424,7 @@ async function feedbackSnapshot(asset){
  if(!readEntrySession()||asset.demo)throw Error('请登录后打开真实作品。');
  const mode=state.mode,token=state.token,cloud=state.cloud;
  if(token){const shared=await cloud.getSharedData(token);return {asset:shared.assets.find(a=>a.id===asset.id),versions:shared.versions.filter(v=>v.asset_id===asset.id),comments:shared.comments.filter(c=>c.asset_id===asset.id),mode,shared};}
- const [assets,versions,comments]=await Promise.all(mode==='cloud'?[cloud.listAssets(),cloud.listVersions(asset.id),cloud.listComments(asset.id)]:[db.getAssets({includeDeleted:true}),db.getVersions(asset.id),db.getComments(asset.id)]);
+ const [assets,versions,comments]=await Promise.all([cloud.listAssets(),cloud.listVersions(asset.id),cloud.listComments(asset.id)]);
  return {asset:assets.find(a=>a.id===asset.id),versions,comments,mode};
 }
 async function refreshFeedback(detail,asset,button){
@@ -336,7 +442,7 @@ async function refreshFeedback(detail,asset,button){
   const status=detail.querySelector('#asset-status');if(status){status.value=asset.status;status.disabled=!canReview()||!selectedId||selectedId!==versions[0]?.id;}
   const badge=detail.querySelector('.viewer-toolbar > .badge');badge.className='badge '+asset.status;badge.textContent=STATUS[asset.status];
   comments(detail);render();
-  toast(mode==='cloud'||token?'已读取共享评审的最新反馈。':'已重新读取本设备的记录；尚未连接云端，不能读取其他设备。');
+  toast('已读取共享评审的最新反馈。');
  }finally{button.disabled=false;}
 }
 function downloadFeedbackFile(name,content,type){
@@ -355,31 +461,45 @@ async function exportReviewRecords(asset){
 }
 
 async function downloadVersion(){if(!state.files.length)throw Error('当前没有可下载的原始文件。');const data={};for(const f of state.files)data[f.relativePath||f.name]=new Uint8Array(await f.arrayBuffer());const blob=new Blob([zipSync(data,{level:0})],{type:'application/zip'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=state.selected.title+'_V'+state.version.number+'.zip';a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}
-async function share(assetId=null){
+async function share(){
  requireStudent();
- if(!state.cloud||state.mode!=='cloud'||state.role!=='owner'){toast('请先连接共享评审、登录所有者账号并上传作品，再生成老师专属链接。');settings();return;}
- if(location.protocol!=='https:'||['localhost','127.0.0.1','::1','[::1]'].includes(location.hostname))throw Error('请先把网站发布到 GitHub Pages，再从正式网址生成老师链接。');
- const deployed=state.deployedConfig;
- if(!deployed?.supabaseUrl||!deployed?.supabaseAnonKey||deployed.supabaseUrl.trim().replace(/\/$/,'')!==state.config.supabaseUrl.trim().replace(/\/$/,'')||deployed.supabaseAnonKey.trim()!==state.config.supabaseAnonKey.trim())throw Error('当前连接只在本机保存。请将相同的公开云配置发布到网站，再刷新页面生成老师链接；否则老师的设备无法连接。');
- const data=await state.cloud.createReviewLink(assetId);const url=new URL(location.href);url.hash='review='+data.token;url.search='';
- const d=dialog('老师专属评审链接','<p>老师打开链接即可预览和留言，无需注册账号。</p><label class="field">有效至 '+esc(date(data.expires_at))+'<input readonly id="review-url" value="'+esc(url.href)+'"></label><p class="help-text">此链接可访问'+(assetId?'当前作品':'全部共享作品')+'。你可以提前撤销，原始文件仍保留。</p><div class="form-actions"><button class="button ghost" id="revoke">撤销此链接</button><button class="button primary" id="copy-link">复制链接</button></div>');
- d.querySelector('#copy-link').onclick=run(async()=>{await navigator.clipboard.writeText(url.href);toast('链接已复制，可以发给老师。');});
- d.querySelector('#revoke').onclick=run(async()=>{await state.cloud.revokeReviewLink(data.id);d.close();toast('此评审链接已撤销。');});
+ const url=new URL(location.href);url.hash='';url.search='';
+ const d=dialog('邀请老师评审','<p>老师在自己的手机或电脑打开相同网址，输入教师访问密码，即可查看所有已提交的作品，并保存意见与检查状态。</p><label class="field">网站地址<input readonly id="review-url"></label><p class="help-text">链接不包含密码。学生提交的作品与老师反馈都会保存到共享评审。</p><div class="form-actions"><button class="button primary" id="copy-link">复制网址</button></div>');
+ d.querySelector('#review-url').value=url.href;
+ d.querySelector('#copy-link').onclick=async()=>{try{await navigator.clipboard.writeText(url.href);toast('网址已复制，可以发给老师。');}catch{const field=d.querySelector('#review-url');field.focus();field.select();toast('网址已选中，请长按复制。');}};
 }
-function settings(){
- if(!state.entryRole||state.token)return;
- const d=dialog('连接与账户','<p class="help-text">GitHub Pages 托管页面；共享存储保存文件、版本与老师意见。未连接时仍可使用本机草稿。</p><form id="config-form" class="form-grid"><label class="field">Supabase 项目地址<input name="url" type="url" value="'+esc(state.config.supabaseUrl||'')+'" placeholder="https://你的项目.supabase.co"></label><label class="field">公开 publishable / anon key<input name="key" value="'+esc(state.config.supabaseAnonKey||'')+'" autocomplete="off" placeholder="仅填写公开密钥"></label><p class="help-text">这里不能填写 secret 或 service_role 密钥。正式部署请在仓库配置公开连接参数。</p><div class="form-actions"><button class="button ghost">连接共享评审</button></div></form><hr><form id="login-form" class="form-grid"><h3>共享账户登录</h3><label class="field">邮箱<input name="email" type="email" required placeholder="你的邮箱"></label><div class="form-actions"><button class="button primary">发送邮箱登录链接</button><button class="button ghost" type="button" id="signout">退出登录</button></div><p class="help-text">首次使用需要完成共享存储初始化，并把你的账户设置为项目所有者。老师只需专属链接。</p></form>');
- d.querySelector('#config-form').onsubmit=run(async e=>{e.preventDefault();const f=new FormData(e.target);const config={...state.config,supabaseUrl:f.get('url').trim(),supabaseAnonKey:f.get('key').trim()};const cloud=createCloud(config);state.cloud=cloud;state.config=config;localStorage.setItem('qixi-config',JSON.stringify(config));state.mode='cloud';await refresh();toast('连接参数已保存；请使用所有者邮箱登录。');});
- d.querySelector('#login-form').onsubmit=run(async e=>{e.preventDefault();if(!state.cloud)throw Error('请先连接共享评审。');await state.cloud.signIn(new FormData(e.target).get('email').trim());toast('登录链接已发送，请在邮箱中打开。');});
- d.querySelector('#signout').onclick=run(async()=>{await state.cloud?.signOut();state.mode='local';d.close();await refresh();toast('已退出共享评审账户。');});
-}
-function help(){dialog('提交与检查说明','<div class="help-content"><h3>1 · 添加作品与提交版本</h3><p>五类作品的数量不限。场景、角色、产品及动画提交一个 FBX，并同时选择外部贴图；游戏特效提交 MP4。新版本不会覆盖旧文件，意见按版本分别保存。</p><h3>2 · 检查模型</h3><p>旋转、平移、缩放模型，切换材质、线框与法向着色。结构面板可以开关实际节点；材质面板列出实际加载的材质和贴图槽。动画支持片段切换、时间拖动与速度调整。</p><p>三角面数是浏览器导入后三角化的数量，缓冲顶点并非建模软件原始顶点。FBX 材质与 UE 复杂材质可能不同；蒙皮动画应使用法向着色，静态箭头不会表达骨骼变形。只有骨架而没有角色网格的动画需要同时导出对应角色。</p><h3>3 · 给老师评审</h3><p>连接共享存储并以所有者登录，上传作品，再点击“邀请老师评审”。老师打开专属链接即可留下意见。意见会记录版本、模型视角或视频时间点；访客的“建议通过”不会自行改变你的作品进度。</p><h3>4 · 保存与部署</h3><p>“本机草稿”仅在当前浏览器可见，清除浏览器数据会影响草稿，请下载版本备份。GitHub Pages 负责网页托管，跨设备文件与意见由已配置的共享存储保存。MP4 推荐 H.264 / AAC 编码。</p></div>');}
+function settings(){dialog('共享评审','<p>作品、原始文件、历史版本与老师反馈统一保存在共享评审中。手机 QQ、微信和电脑打开同一个网址，登录后即可查看。</p>');}
+function help(){dialog('提交与检查说明','<div class="help-content"><h3>1 · 添加作品与提交版本</h3><p>五类作品的数量不限。场景、角色、产品及动画提交一个 FBX，并同时选择外部贴图；游戏特效提交 MP4。新版本保留旧文件，意见按版本分别保存。</p><h3>2 · 检查模型</h3><p>旋转、平移、缩放模型，切换材质、线框与法向着色。结构面板可开关实际节点；材质面板列出实际加载的贴图。动画支持片段切换与时间拖动。FBX 无法完整携带 UE 的三渲二材质与后期效果，以引擎画面为准。</p><h3>3 · 手机与电脑共享</h3><p>学生与老师使用同一个网址，以各自的访问密码登录。作品、版本、已读信息、检查状态和留言保存在共享评审中。返回页面时会刷新，也可点击“刷新作品”或作品里的“刷新反馈”。网络中断时会提示失败，不会把提交改存到这台设备。</p><h3>4 · 迁移旧作品</h3><p>以前保存在手机 QQ 等浏览器里的旧作品，需要在原来的设备与浏览器登录学生端，点击“迁移这台设备上的旧作品”。作品与版本迁移完成后，其他设备即可查看。若还需迁移原有老师意见与检查结果，可在迁移窗口输入教师访问密码确认；原记录始终保留。</p><h3>5 · 文件备份</h3><p>可下载版本与导出评审记录另行备份。单文件上限 200 MB，每个版本总计 300 MB。MP4 推荐 H.264 / AAC 编码；贴图请与 FBX 一起选择。</p></div>');}
 async function boot(){
- try{const response=await fetch(new URL('config.json',document.baseURI),{cache:'no-store'});if(response.ok){state.deployedConfig=await response.json();state.config={...state.config,...state.deployedConfig};}}catch{}
- try{const saved=JSON.parse(localStorage.getItem('qixi-config')||'null');if(saved&&!state.token)state.config={...state.config,...saved};}catch{}
- if(state.config.supabaseUrl&&state.config.supabaseAnonKey){try{state.cloud=createCloud(state.config);if(await state.cloud.getSession())state.mode='cloud';}catch(e){toast(e.message);}}
- state.entryRole=readEntrySession();
- try{if(state.entryRole)await refresh();else renderAccess();}catch(e){render();toast(e.message);}
+ try{
+  const response=await fetch(new URL('config.json',document.baseURI),{cache:'no-store'});
+  if(!response.ok)throw Error('网站共享配置暂时无法读取，请刷新重试。');
+  state.deployedConfig=await response.json();state.config={...state.config,...state.deployedConfig};
+  if(!state.config.apiUrl)throw Error('共享评审服务尚未配置，当前不能提交或读取作品；请联系项目维护者。');
+  // Never use a saved per-browser backend configuration or an old share token.
+  state.token=null;state.mode='cloud';
+  state.cloud=createSharedApi(state.config,{onUnauthorized:()=>{state.accessError='登录已过期，请重新输入访问密码。';leaveSession({revoke:false});}});
+  state.serviceReady=true;
+  const session=await state.cloud.getSession();
+  if(session){if(!saveEntrySession(session.role))throw Error('浏览器无法保存登录，请允许网站使用会话存储。');state.entryRole=session.role;state.role=session.role==='student'?'owner':'reviewer';}
+  else{clearEntrySession();state.entryRole=null;}
+ }catch(error){state.accessError=error.message||'共享服务暂时无法连接，请刷新重试。';clearEntrySession();state.entryRole=null;}
+ finally{state.booting=false;}
+ if(state.entryRole){await refresh();await maybePromptLegacyMigration();}else renderAccess();
 }
+let backgroundRefresh=false;
+async function refreshVisibleShared(){
+ if(!state.entryRole||!state.serviceReady||document.hidden||state.migrationBusy||backgroundRefresh||feedbackWrites)return;
+ const modal=document.querySelector('dialog');
+ if(modal&&!modal.classList.contains('detail-dialog'))return;
+ const form=modal?.querySelector('#comment-form');if(form?.elements.body?.value.trim())return;
+ backgroundRefresh=true;
+ try{if(modal&&state.selected){const button=modal.querySelector('#refresh-feedback');if(button&&!button.disabled)await refreshFeedback(modal,state.selected,button);}else await refresh();}
+ catch{/* Keep the current view; explicit refresh displays the actionable error. */}
+ finally{backgroundRefresh=false;}
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)void refreshVisibleShared();});
+window.addEventListener('online',()=>void refreshVisibleShared());
+setInterval(()=>void refreshVisibleShared(),30000);
 renderAccess();
 boot();

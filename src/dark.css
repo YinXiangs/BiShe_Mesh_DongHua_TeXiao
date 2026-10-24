@@ -148,3 +148,11 @@ input::placeholder, textarea::placeholder { color: #8ba091; opacity: 1; }
 .feedback-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
 .feedback-storage { background:#373421; border:1px solid #6d6340; border-radius:7px; padding:10px 12px; color:#e0d1a6; font-size:12px; line-height:1.7; }
 .field textarea.feedback-report { min-height:260px; font-size:12px; line-height:1.65; white-space:pre-wrap; }
+/* Shared workspace migration is an explicit one-time import, never a local save mode. */
+.migration-notice{flex-wrap:wrap;gap:14px}.migration-notice>span{flex:1;min-width:200px}.migration-notice button{white-space:normal;text-align:center}
+.migration-list{max-height:310px;overflow:auto;border:1px solid var(--border,#365344);border-radius:12px;margin:18px 0}
+.migration-row{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border,#365344);cursor:pointer}.migration-row:last-child{border-bottom:0}
+.migration-row input,.migration-option input{width:18px;height:18px;flex:none;accent-color:#84ad91}.migration-row span{display:grid;gap:5px;overflow-wrap:anywhere}.migration-row small{color:#b0beb5}
+.migration-option{display:flex;align-items:center;gap:10px;margin:16px 0}.migration-progress{white-space:pre-wrap;overflow-wrap:anywhere;color:#dfc997;line-height:1.7;min-height:28px;margin-top:14px}.migration-results{max-height:240px;overflow:auto;font-size:14px;line-height:1.7}.migration-success{color:#abdab5}.migration-failure{color:#f0a39d}
+.migration-option~.field[hidden]{display:none}
+@media(max-width:640px){.migration-notice button{width:100%}.migration-row{padding:12px}.migration-progress{font-size:14px}}

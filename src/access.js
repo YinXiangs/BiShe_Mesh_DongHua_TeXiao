@@ -1,7 +1,4 @@
-// This is a public site's entry workflow, not server-side authentication.
-// Server permissions and shared storage still need their own authenticated backend.
-const TEACHER_DIGEST = '8343021f8a97747e7bf59d1a3099c5ba68e39c8d38df96dbdc3027cbff7698de';
-const STUDENT_DIGEST = 'bc5fdcd9105691d6914563b7e615d3e2fa2ad9a8a97fb4369c71216f2f3c313c';
+// UI session helpers only. Password verification and role authority live on the shared server.
 const ENTRY_SESSION_KEY = 'qixi-entry-session-v1';
 const SESSION_LIFETIME_MS = 8 * 60 * 60 * 1000;
 const ROLES = new Set(['teacher', 'student']);
@@ -9,22 +6,6 @@ const ROLES = new Set(['teacher', 'student']);
 function entryStorage(storage) {
   if (storage !== undefined) return storage;
   try { return globalThis.sessionStorage; } catch { return null; }
-}
-
-/** Public fingerprint only: short access codes remain guessable from public code. */
-export async function digestPassword(password) {
-  if (typeof password !== 'string') throw new TypeError('请输入有效的访问密码。');
-  const input = new TextEncoder().encode('qixi-entry-v1:' + password);
-  const digest = await crypto.subtle.digest('SHA-256', input);
-  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
-}
-
-export async function verifyEntryPassword(password) {
-  if (typeof password !== 'string' || !password) return null;
-  const digest = await digestPassword(password);
-  if (digest === TEACHER_DIGEST) return 'teacher';
-  if (digest === STUDENT_DIGEST) return 'student';
-  return null;
 }
 
 export function readEntrySession(storage, now = Date.now()) {
