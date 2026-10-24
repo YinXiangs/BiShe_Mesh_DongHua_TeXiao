@@ -1,5 +1,6 @@
 import { ReviewViewer, encodeThumbnail } from './viewer.js';
 import { validateFiles } from './validation.js';
+import { PREVIEW_REVISION } from './material-preview.js';
 
 let jobs=Promise.resolve(),viewer,host;
 
@@ -31,6 +32,7 @@ async function generate(files,category){
     if(preview.clips.length){preview.selectClip(0);preview.setTime(Math.min(1,Math.max(0,preview.clip.duration*.25)));}
     const stats=preview.stats;
     return {thumbnail:preview.thumbnail(),stats:{
+      previewRevision:PREVIEW_REVISION,
       triangles:stats.triangles,vertices:stats.vertices,meshes:stats.meshes,
       materialCount:stats.materialCount,bones:stats.bones,skinned:stats.skinned,
       animationCount:preview.clips.length,

@@ -1,4 +1,5 @@
 // Derived previews live separately from the user's original submissions.
+import { PREVIEW_REVISION } from './material-preview.js';
 const DATABASE = 'qixi-post-review-previews-v1';
 let connection;
 
@@ -30,7 +31,7 @@ async function access(mode, operation) {
   } catch { return null; } // Cache failures must never affect source files or uploads.
 }
 
-const cacheKey = (scope, versionId) => `material-v1|${scope}|${versionId}`;
+const cacheKey = (scope, versionId) => `${PREVIEW_REVISION}|${scope}|${versionId}`;
 export async function readPreview(scope, versionId) {
   const value = await access('readonly', store => store.get(cacheKey(scope, versionId)));
   return validPreview(value) ? value : null;

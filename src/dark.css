@@ -138,3 +138,10 @@ input::placeholder, textarea::placeholder { color: #8ba091; opacity: 1; }
 .asset-preview > img, .asset-preview > svg { display: block; width: 100%; height: 100%; object-fit: contain; }
 .preview-message { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 18px; color: #adc5b5; font-size: 12px; line-height: 1.7; text-align: center; }
 .asset-preview .preview-message > svg { flex: 0 0 24px; width: 24px; height: 24px; }
+.preview-adjustments { display:flex; flex-wrap:wrap; gap:14px 24px; align-items:center; padding:10px 16px; border-top:1px solid #30473b; color:#c5d2ca; font-size:12px; }
+.preview-adjustments label { display:flex; gap:8px; align-items:center; }
+.preview-adjustments input[type=range] { width:110px; accent-color:#8eb9a0; }
+.preview-adjustments input[type=checkbox] { accent-color:#8eb9a0; }
+.preview-adjustments output { min-width:40px; font-variant-numeric:tabular-nums; }
+.preview-note { margin:0; padding:0 16px 12px; color:#a3b6aa; font-size:12px; line-height:1.7; }
+#view-controls .viewer-toolbar, #view-controls .viewer-tools { flex-wrap:wrap; }

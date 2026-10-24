@@ -3,6 +3,9 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { TGALoader } from 'three/addons/loaders/TGALoader.js';
 import { VertexNormalsHelper } from 'three/addons/helpers/VertexNormalsHelper.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { makePreviewMaterial, addNeutralLights } from './material-preview.js';
+import { restoreFbxPbrMaps } from './fbx-pbr.js';
 
 export function inspectObject(root) {
   let triangles=0,vertices=0,meshes=0,bones=0,skinned=0,missingNormals=0;
@@ -17,37 +20,36 @@ export function inspectObject(root) {
     vertices+=p.count*instances; triangles+=(g.index?g.index.count:p.count)/3*instances;
     if(!g.getAttribute('normal'))missingNormals++;
     for(const m of (Array.isArray(node.material)?node.material:[node.material])) if(m) {
-      const maps=['map','normalMap','bumpMap','roughnessMap','metalnessMap','emissiveMap','alphaMap'].filter(k=>m[k]).map(k=>({slot:k,name:m[k].name||'嵌入或外部贴图'}));
-      materials.set(m.uuid,{id:m.uuid,name:m.name||'未命名材质',type:m.type,maps,color:m.color?'#'+m.color.getHexString():'#999999'});
+      const maps=['map','normalMap','bumpMap','roughnessMap','metalnessMap','aoMap','emissiveMap','alphaMap'].filter(k=>m[k]||m.reviewPbr?.[k]).map(k=>{const t=m[k]||m.reviewPbr[k];return {slot:k,name:t.name||'嵌入或外部贴图',missing:Boolean(t.userData.reviewMissing)};});
+      materials.set(m.uuid,{id:m.uuid,name:m.name||'未命名材质',type:m.type,maps,pbrRestored:Boolean(m.reviewPbr),color:m.color?'#'+m.color.getHexString():'#999999'});
     }
   });
   const box=new THREE.Box3().setFromObject(root),size=box.getSize(new THREE.Vector3());
   return {triangles:Math.round(triangles),vertices,meshes,bones,skinned,missingNormals,materialCount:materials.size,materials:[...materials.values()],nodes,size:size.toArray(),animations:(root.animations||[]).map(c=>({name:c.name||'未命名动作',duration:c.duration}))};
 }
 function depth(n,root){let d=0;while(n!==root&&n.parent){d++;n=n.parent;}return d;}
-function dispose(root){root?.traverse(o=>{o.geometry?.dispose();for(const m of(Array.isArray(o.material)?o.material:[o.material]))if(m){for(const v of Object.values(m))if(v?.isTexture)v.dispose();m.dispose();}});}
+function dispose(root){const textures=new Set(),materials=new Set();root?.traverse(o=>{o.geometry?.dispose();for(const m of(Array.isArray(o.material)?o.material:[o.material]))if(m&&!materials.has(m)){materials.add(m);for(const v of [...Object.values(m),...Object.values(m.reviewPbr||{})])if(v?.isTexture)textures.add(v);m.dispose();}});for(const t of textures)t.dispose();}
 
 export class ReviewViewer {
   constructor(container,onUpdate=()=>{},options={}) {
-    this.container=container;this.onUpdate=onUpdate;this.urls=[];this.helpers=[];this.mode='material';this.playing=false;this.speed=1;this.frame=0;this.dead=false;this.clips=[];this.loadId=0;
+    this.container=container;this.onUpdate=onUpdate;this.urls=[];this.helpers=[];this.mode='material';this.normalY=1;this.exposure=1;this.previewMaterials=new Set();this.originals=new Map();this.playing=false;this.speed=1;this.frame=0;this.dead=false;this.clips=[];this.loadId=0;
     this.renderer=new THREE.WebGLRenderer({antialias:true,alpha:false,preserveDrawingBuffer:true});
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio,2));this.renderer.setClearColor(0x141e1a);this.renderer.outputColorSpace=THREE.SRGBColorSpace;
-    this.renderer.toneMapping=THREE.ACESFilmicToneMapping;this.renderer.toneMappingExposure=1.25;
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio,2));this.renderer.setClearColor(0x202328);this.renderer.outputColorSpace=THREE.SRGBColorSpace;
+    this.renderer.toneMapping=THREE.ACESFilmicToneMapping;this.renderer.toneMappingExposure=this.exposure;
     this.renderer.domElement.className='viewer-canvas';this.renderer.domElement.setAttribute('aria-label','可旋转缩放的三维模型预览');container.append(this.renderer.domElement);
     this.scene=new THREE.Scene();this.camera=new THREE.PerspectiveCamera(42,1,.01,10000);this.camera.position.set(5,3.5,5);
+    const room=new RoomEnvironment(),pmrem=new THREE.PMREMGenerator(this.renderer);this.environment=pmrem.fromScene(room,.04);this.scene.environment=this.environment.texture;this.scene.environmentIntensity=.35;room.dispose();pmrem.dispose();
     this.controls=new OrbitControls(this.camera,this.renderer.domElement);this.controls.enableDamping=true;
-    this.scene.add(new THREE.HemisphereLight(0xffffff,0x737c61,3));
-    const key=new THREE.DirectionalLight(0xffe6c7,3.5);key.position.set(5,8,6);this.scene.add(key);
-    const fill=new THREE.DirectionalLight(0xb6d6e6,2);fill.position.set(-6,3,-3);this.scene.add(fill);
-    this.grid=new THREE.GridHelper(20,20,0x4d6b5a,0x293f33);this.grid.position.y=-.015;this.grid.visible=options.grid!==false;this.scene.add(this.grid);
+    addNeutralLights(this.scene);
+    this.grid=new THREE.GridHelper(20,20,0x50555e,0x333840);this.grid.position.y=-.015;this.grid.visible=options.grid!==false;this.scene.add(this.grid);
     this.resize=new ResizeObserver(()=>this.fitCanvas());this.resize.observe(container);this.clock=new THREE.Clock();
     this.loop=()=>{if(this.dead)return;this.frame=requestAnimationFrame(this.loop);const dt=Math.min(this.clock.getDelta(),.1);if(this.mixer&&this.playing)this.mixer.update(dt*this.speed);this.renderFrame();};if(options.animate!==false)this.loop();
   }
   renderFrame(){if(this.dead)return;this.controls.update();this.skeleton?.update();this.renderer.render(this.scene,this.camera);}
   fitCanvas(){const {width,height}=this.container.getBoundingClientRect();if(!width||!height)return;this.renderer.setSize(width,height,false);this.camera.aspect=width/height;this.camera.updateProjectionMatrix();this.renderFrame();}
-  clear(){this.loadId++;this.clearHelpers();this.mixer?.stopAllAction();if(this.mixer&&this.root)this.mixer.uncacheRoot(this.root);if(this.root){this.scene.remove(this.root);dispose(this.root);}this.root=null;this.stats=null;this.mixer=null;this.action=null;this.clip=null;this.clips=[];this.playing=false;this.originals=new Map();for(const u of this.urls)URL.revokeObjectURL(u);this.urls=[];this.renderFrame();}
+  clear(){this.loadId++;this.clearHelpers();this.mixer?.stopAllAction();if(this.mixer&&this.root)this.mixer.uncacheRoot(this.root);if(this.root){this.root.traverse(o=>{if(o.isMesh&&this.originals.has(o.uuid))o.material=this.originals.get(o.uuid);});this.scene.remove(this.root);dispose(this.root);}for(const m of this.previewMaterials)m.dispose();this.previewMaterials.clear();this.root=null;this.stats=null;this.mixer=null;this.action=null;this.clip=null;this.clips=[];this.playing=false;this.originals=new Map();for(const u of this.urls)URL.revokeObjectURL(u);this.urls=[];this.renderFrame();}
   async loadFiles(files){
-    this.clear();const loadId=this.loadId,main=files.find(f=>/\.fbx$/i.test(f.name));if(!main)throw Error('请选择一个 FBX 模型或动画文件。');
+    this.clear();const loadId=this.loadId,activeUrls=this.urls,main=files.find(f=>/\.fbx$/i.test(f.name));if(!main)throw Error('请选择一个 FBX 模型或动画文件。');
     const map=new Map(),byName=new Map(),missing=new Set();
     for(const f of files){const u=URL.createObjectURL(f);this.urls.push(u);const name=normalize(f.relativePath||f.webkitRelativePath||f.name);map.set(name,u);byName.set(f.name.toLowerCase(),u);}
     const manager=new THREE.LoadingManager();let started=false,completeTextures,timer,object;
@@ -55,19 +57,23 @@ export class ReviewViewer {
     manager.onStart=()=>{started=true;};manager.onLoad=()=>completeTextures();
     const placeholder='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
     manager.setURLModifier(url=>{
-      if(/^(blob:|data:)/i.test(url)){if(/^blob:/i.test(url)&&!this.urls.includes(url))this.urls.push(url);return url;}
+      if(/^(blob:|data:)/i.test(url)){if(/^blob:/i.test(url)&&!activeUrls.includes(url))activeUrls.push(url);return url;}
       const n=normalize(url),basename=n.split('/').pop();const found=map.get(n)||byName.get(basename);
       if(found)return found;missing.add(url);return placeholder;
     });
     manager.addHandler(/\.tga$/i,new TGALoader(manager));
     manager.onError=url=>missing.add(url);
+    manager.reviewMissingTexture=url=>missing.has(url);
     try{
       const data=await main.arrayBuffer();if(this.dead||loadId!==this.loadId)throw Error('模型预览已取消。');object=new FBXLoader(manager).parse(data,'');
       if(started)await Promise.race([texturesReady,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('模型贴图读取超时，请检查贴图后重试。')),15000);})]);
+      clearTimeout(timer);
+      const restored=await restoreFbxPbrMaps(object,data,manager,activeUrls);
       if(this.dead||loadId!==this.loadId)throw Error('模型预览已取消。');
-      this.setObject(object);this.stats.missingTextures=[...missing];this.onUpdate(this.stats);this.renderFrame();return this.stats;
+      object.traverse(o=>{if(o.isMesh)for(const m of(Array.isArray(o.material)?o.material:[o.material]))if(m)for(const t of Object.values(m))if(t?.isTexture&&t.image?.src===placeholder)t.userData.reviewMissing=true;});
+      this.setObject(object);this.stats.missingTextures=[...missing];this.stats.pbrRecovery=restored;this.onUpdate(this.stats);this.renderFrame();return this.stats;
     }catch(error){if(object&&object!==this.root)dispose(object);if(loadId===this.loadId)this.clear();throw error;}
-    finally{clearTimeout(timer);}
+    finally{clearTimeout(timer);if(this.dead||loadId!==this.loadId)for(const url of activeUrls)URL.revokeObjectURL(url);}
   }
   loadDemo(kind){this.clear();this.setObject(makeDemo(kind));return this.stats;}
   setObject(object){
@@ -77,18 +83,18 @@ export class ReviewViewer {
     const scale=5/Math.max(size.x,size.y,size.z);object.scale.multiplyScalar(scale);object.updateMatrixWorld(true);
     box=new THREE.Box3().setFromObject(object);center=box.getCenter(new THREE.Vector3());object.position.x-=center.x;object.position.z-=center.z;object.position.y-=box.min.y;
     object.updateMatrixWorld(true);this.scene.add(object);this.originals=new Map();
-    object.traverse(o=>{if(o.isMesh)this.originals.set(o.uuid,o.material);});
-    this.stats=inspectObject(object);this.clips=object.animations||[];
+    object.traverse(o=>{if(o.isLight)o.visible=false;if(o.isMesh)this.originals.set(o.uuid,o.material);});
+    this.stats=inspectObject(object);this.viewCenter=new THREE.Vector3(0,this.stats.size[1]/2,0);this.viewRadius=new THREE.Vector3(...this.stats.size).length()/2;this.clips=object.animations||[];
     if(this.clips.length){this.mixer=new THREE.AnimationMixer(object);this.selectClip(0);}
     this.resetCamera();this.setMode(this.mode);this.fitCanvas();this.onUpdate(this.stats);
   }
-  resetCamera(){this.controls.target.set(0,1.7,0);this.camera.position.set(6.8,4.6,7.4);this.controls.update();this.renderFrame();}
-  setMode(mode){this.mode=mode;this.clearHelpers();this.root?.traverse(o=>{if(!o.isMesh)return;
-    const old=o.material,original=this.originals.get(o.uuid);if(old!==original)for(const m of(Array.isArray(old)?old:[old]))m.dispose();
-    if(mode==='normal')o.material=new THREE.MeshNormalMaterial({side:THREE.DoubleSide});
-    else if(mode==='wireframe')o.material=(Array.isArray(original)?original:[original]).map(m=>{const clone=m.clone();clone.wireframe=true;clone.map=null;clone.emissiveMap=null;clone.color?.set(0xadd7bf);clone.emissive?.set(0x2c4d3b);return clone;});
-    else o.material=original;
+  resetCamera(){const center=this.viewCenter||new THREE.Vector3(0,1.7,0),distance=(this.viewRadius||3)/Math.sin(THREE.MathUtils.degToRad(this.camera.fov/2))*1.05;this.controls.target.copy(center);this.camera.position.copy(new THREE.Vector3(.8,.55,1).normalize().multiplyScalar(distance).add(center));this.controls.update();this.renderFrame();}
+  setMode(mode){this.mode=mode;this.clearHelpers();for(const m of this.previewMaterials)m.dispose();this.previewMaterials.clear();const cache=new Map();this.root?.traverse(o=>{if(!o.isMesh)return;
+    const original=this.originals.get(o.uuid);const preview=m=>{if(!cache.has(m)){const clone=makePreviewMaterial(m,mode,this.normalY);cache.set(m,clone);this.previewMaterials.add(clone);}return cache.get(m);};
+    o.material=Array.isArray(original)?original.map(preview):preview(original);
   });this.renderFrame();}
+  setExposure(value){this.exposure=THREE.MathUtils.clamp(Number(value)||1,.4,1.8);this.renderer.toneMappingExposure=this.exposure;this.renderFrame();}
+  flipNormalY(on){this.normalY=on?-1:1;this.setMode(this.mode);}
   showNormals(on){this.clearHelpers();if(!on||!this.root){this.renderFrame();return;}if(this.stats.skinned){this.renderFrame();throw Error('骨骼动画请使用“法向着色”。箭头仅适用于静态网格。');}
     this.root.traverse(o=>{if(o.isMesh&&o.geometry.getAttribute('normal')){const h=new VertexNormalsHelper(o,.07,0x82cda2);this.scene.add(h);this.helpers.push(h);}});
     this.renderFrame();
@@ -98,10 +104,10 @@ export class ReviewViewer {
   nodeVisible(id,value){const o=this.root?.getObjectByProperty('uuid',id);if(o)o.visible=value;this.renderFrame();}
   selectClip(i){if(!this.mixer)return;this.mixer.stopAllAction();this.clip=this.clips[i];this.action=this.mixer.clipAction(this.clip);this.action.play();this.mixer.setTime(0);this.playing=true;this.renderFrame();}
   setTime(t){if(this.mixer){this.mixer.setTime(Number(t));this.playing=false;this.renderFrame();}}
-  context(){return {camera:this.camera.position.toArray(),target:this.controls.target.toArray(),time:this.action?.time||0,clip:this.clip?.name||'',mode:this.mode};}
-  restore(c){if(c?.camera?.length===3&&c?.target?.length===3&&[...c.camera,...c.target].every(Number.isFinite)){this.camera.position.fromArray(c.camera);this.controls.target.fromArray(c.target);this.controls.update();}if(Number.isFinite(c?.time))this.setTime(c.time);this.renderFrame();}
+  context(){return {camera:this.camera.position.toArray(),target:this.controls.target.toArray(),time:this.action?.time||0,clip:this.clip?.name||'',mode:this.mode,exposure:this.exposure,normalY:this.normalY};}
+  restore(c){if(c?.camera?.length===3&&c?.target?.length===3&&[...c.camera,...c.target].every(Number.isFinite)){this.camera.position.fromArray(c.camera);this.controls.target.fromArray(c.target);this.controls.update();}if(Number.isFinite(c?.time))this.setTime(c.time);if(['material','fbx','albedo','clay','normal','wireframe'].includes(c?.mode)){this.normalY=c.normalY===-1?-1:1;this.setMode(c.mode);}if(Number.isFinite(c?.exposure))this.setExposure(c.exposure);this.renderFrame();}
   thumbnail(){this.renderFrame();return encodeThumbnail(this.renderer.domElement);}
-  destroy(){this.dead=true;cancelAnimationFrame(this.frame);this.resize.disconnect();this.controls.dispose();this.clear();this.grid.geometry.dispose();this.grid.material.dispose();this.renderer.dispose();this.renderer.domElement.remove();}
+  destroy(){this.dead=true;cancelAnimationFrame(this.frame);this.resize.disconnect();this.controls.dispose();this.clear();this.grid.geometry.dispose();this.grid.material.dispose();this.environment.dispose();this.renderer.dispose();this.renderer.domElement.remove();}
 }
 export function encodeThumbnail(source,{width=640,height=400,maxBytes=180*1024}={}){
   const canvas=document.createElement('canvas');let quality=.78;
