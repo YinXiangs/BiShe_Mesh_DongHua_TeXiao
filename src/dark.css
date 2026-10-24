@@ -145,3 +145,6 @@ input::placeholder, textarea::placeholder { color: #8ba091; opacity: 1; }
 .preview-adjustments output { min-width:40px; font-variant-numeric:tabular-nums; }
 .preview-note { margin:0; padding:0 16px 12px; color:#a3b6aa; font-size:12px; line-height:1.7; }
 #view-controls .viewer-toolbar, #view-controls .viewer-tools { flex-wrap:wrap; }
+.feedback-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+.feedback-storage { background:#373421; border:1px solid #6d6340; border-radius:7px; padding:10px 12px; color:#e0d1a6; font-size:12px; line-height:1.7; }
+.field textarea.feedback-report { min-height:260px; font-size:12px; line-height:1.65; white-space:pre-wrap; }
